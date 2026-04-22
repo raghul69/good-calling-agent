@@ -4,7 +4,7 @@ import { ArrowRight, ChartLineUp, CheckCircle, Gear, MicrophoneStage, PhoneCall,
 import VoiceTester from './VoiceTester';
 import TerminalPage from './Terminal';
 import Login from './Login';
-import { authFetch, clearAccessToken, getAccessToken } from './auth';
+import { apiUrl, authFetch, clearAccessToken, getAccessToken } from './auth';
 import heroAsset from './assets/hero.png';
 import './App.css';
 
@@ -237,7 +237,7 @@ function Dashboard() {
   useEffect(() => {
     (async () => {
       try {
-        const h = await fetch('/api/health');
+        const h = await fetch(apiUrl('/api/health'));
         if (h.ok) setHealth(await h.json());
       } catch {
         setHealth({});

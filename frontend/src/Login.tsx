@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { useNavigate } from "react-router-dom";
-import { setAccessToken } from "./auth";
+import { apiUrl, setAccessToken } from "./auth";
 
 function getErrorMessage(data: any, fallback: string) {
   if (typeof data?.detail === "string") return data.detail;
@@ -26,7 +26,7 @@ export default function Login() {
     try {
       if (mode === "otp") {
         const endpoint = otpSent ? "/api/auth/otp/verify" : "/api/auth/otp/send";
-        const res = await fetch(endpoint, {
+        const res = await fetch(apiUrl(endpoint), {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(otpSent ? { email, token: otp } : { email }),
@@ -57,7 +57,7 @@ export default function Login() {
       }
 
       const endpoint = mode === "login" ? "/api/auth/login" : "/api/auth/signup";
-      const res = await fetch(endpoint, {
+      const res = await fetch(apiUrl(endpoint), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ email, password }),

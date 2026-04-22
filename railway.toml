@@ -1,0 +1,10 @@
+# Railway config-as-code: https://docs.railway.com/deploy/config-as-code
+# Set service "Root Directory" to this folder (InboundAIVoice) when the Git repo root is a monorepo.
+
+[build]
+builder = "DOCKERFILE"
+dockerfilePath = "Dockerfile"
+
+[deploy]
+healthcheckPath = "/api/health"
+healthcheckTimeout = 120

@@ -85,6 +85,7 @@ def _apply_config_env() -> None:
         os.environ["SUPABASE_URL"] = config.get("supabase_url", "")
     if config.get("supabase_key"):
         os.environ["SUPABASE_KEY"] = config.get("supabase_key", "")
+        os.environ.setdefault("SUPABASE_ANON_KEY", config.get("supabase_key", ""))
     if config.get("supabase_service_role_key"):
         os.environ["SUPABASE_SERVICE_ROLE_KEY"] = config.get("supabase_service_role_key", "")
 

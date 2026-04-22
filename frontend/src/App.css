@@ -1,3 +1,47 @@
+.landing-hero {
+  background:
+    linear-gradient(115deg, rgba(7, 16, 15, 0.98) 0%, rgba(11, 31, 29, 0.94) 46%, rgba(2, 8, 14, 0.98) 100%),
+    #07100f;
+}
+
+.landing-grid {
+  position: absolute;
+  inset: 0;
+  background-image:
+    linear-gradient(rgba(255, 255, 255, 0.045) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(255, 255, 255, 0.045) 1px, transparent 1px);
+  background-size: 72px 72px;
+  mask-image: linear-gradient(to bottom, rgba(0, 0, 0, 0.9), transparent 78%);
+}
+
+.landing-hero-asset {
+  position: absolute;
+  right: min(6vw, 72px);
+  top: 108px;
+  width: min(34vw, 430px);
+  min-width: 260px;
+  opacity: 0.24;
+  filter: drop-shadow(0 28px 60px rgba(16, 185, 129, 0.18));
+  pointer-events: none;
+}
+
+.landing-console {
+  min-height: 438px;
+}
+
+@media (max-width: 1024px) {
+  .landing-hero-asset {
+    right: -80px;
+    top: 94px;
+    width: 320px;
+    opacity: 0.18;
+  }
+
+  .landing-console {
+    min-height: 0;
+  }
+}
+
 .counter {
   font-size: 16px;
   padding: 5px 10px;

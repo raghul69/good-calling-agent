@@ -28,6 +28,7 @@ Keys needed for Render or Railway:
 
 - `SUPABASE_URL`
 - `SUPABASE_KEY` - anon public key
+- `SUPABASE_ANON_KEY` - optional alias for the same anon public key
 - `SUPABASE_SERVICE_ROLE_KEY` - server only, never expose in frontend
 - `SUPABASE_S3_ACCESS_KEY`
 - `SUPABASE_S3_SECRET_KEY`
@@ -42,6 +43,7 @@ Required environment variables:
 
 - `SUPABASE_URL`
 - `SUPABASE_KEY`
+- `SUPABASE_ANON_KEY`
 - `SUPABASE_SERVICE_ROLE_KEY`
 - `SUPABASE_S3_ACCESS_KEY`
 - `SUPABASE_S3_SECRET_KEY`
@@ -84,6 +86,8 @@ The response should show:
 - `livekit.configured: true`
 - `livekit.url_valid: true`
 
+If the login form shows `Supabase not configured`, the backend is missing `SUPABASE_URL` plus either `SUPABASE_KEY` or `SUPABASE_ANON_KEY`. Restart the service after adding the variables.
+
 ## 2c. GitHub → Railway (direct deploy, InboundAIVoice)
 
 This app ships as a **single Docker image**: [Dockerfile](Dockerfile) builds the Vite frontend, installs Python deps, and runs [supervisord.conf](supervisord.conf) (FastAPI + LiveKit agent). [railway.toml](railway.toml) pins **Dockerfile** build and **`/api/health`**. [.dockerignore](.dockerignore) keeps the build context small.
@@ -108,6 +112,23 @@ This app ships as a **single Docker image**: [Dockerfile](Dockerfile) builds the
 1. Open `https://YOUR_SERVICE.up.railway.app/api/health` and confirm flags in §2b.
 2. Complete **§1 Supabase Auth** URL configuration using that **exact** public origin (Site URL + Redirect URLs).
 3. Smoke-test login, demo call, and outbound call per **§3**.
+
+## 2d. Cursor MCP for Supabase
+
+Cursor MCP config lives at `C:\Users\raghu\.cursor\mcp.json`. This repo expects the official hosted Supabase MCP server:
+
+```json
+{
+  "mcpServers": {
+    "supabase": {
+      "url": "https://mcp.supabase.com/mcp?read_only=true",
+      "headers": {}
+    }
+  }
+}
+```
+
+After editing MCP config, restart Cursor, open **Settings -> Cursor Settings -> Tools & MCP**, and sign in to Supabase when prompted. The MCP connection helps inspect Supabase tables and settings, but the running app still needs `SUPABASE_URL`, `SUPABASE_KEY` or `SUPABASE_ANON_KEY`, and `SUPABASE_SERVICE_ROLE_KEY` in its backend environment.
 
 ## 3. LiveKit Demo Call Test
 

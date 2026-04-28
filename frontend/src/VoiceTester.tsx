@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import { LiveKitRoom, RoomAudioRenderer, StartAudio, useVoiceAssistant } from '@livekit/components-react';
 import '@livekit/components-styles';
-import { authFetch } from './auth';
+import { api } from './lib/api';
 
 export default function VoiceTester() {
   const [token, setToken] = useState("");
@@ -11,10 +11,9 @@ export default function VoiceTester() {
   const connect = async () => {
     setConnecting(true);
     try {
-      const res = await authFetch('/api/demo-token');
-      const data = await res.json();
-      if (res.status === 401) throw new Error("Unauthorized. Please login again.");
+      const data = await api.demoToken();
       if (data.error) throw new Error(data.error);
+      if (!data.token || !data.url) throw new Error("LiveKit token response is incomplete.");
       setToken(data.token);
       setUrl(data.url);
     } catch (err: any) {

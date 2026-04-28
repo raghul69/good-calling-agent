@@ -1,22 +1,19 @@
-export const ACCESS_TOKEN_KEY = "rx_access_token";
+import { apiFetch, apiUrl, getAccessToken, signOut } from "./lib/api";
 
-export function getAccessToken(): string {
-  return localStorage.getItem(ACCESS_TOKEN_KEY) || "";
-}
-
-export function setAccessToken(token: string): void {
-  localStorage.setItem(ACCESS_TOKEN_KEY, token);
-}
-
-export function clearAccessToken(): void {
-  localStorage.removeItem(ACCESS_TOKEN_KEY);
-}
+export { apiUrl, getAccessToken };
 
 export async function authFetch(input: RequestInfo | URL, init: RequestInit = {}) {
-  const token = getAccessToken();
-  const headers = new Headers(init.headers || {});
-  if (token) {
-    headers.set("Authorization", `Bearer ${token}`);
+  if (typeof input !== "string") {
+    return fetch(input, init);
   }
-  return fetch(input, { ...init, headers });
+  const token = await getAccessToken();
+  const headers = new Headers(init.headers || {});
+  if (token) headers.set("Authorization", `Bearer ${token}`);
+  return fetch(apiUrl(input), { ...init, headers, mode: "cors" });
 }
+
+export async function clearAccessToken(): Promise<void> {
+  await signOut();
+}
+
+export { apiFetch };

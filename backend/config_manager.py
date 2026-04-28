@@ -3,10 +3,11 @@ import os
 import logging
 from dotenv import load_dotenv
 
-load_dotenv()
+PROJECT_ROOT = os.path.dirname(os.path.dirname(__file__))
+load_dotenv(os.path.join(PROJECT_ROOT, ".env"))
 logger = logging.getLogger("config_manager")
 
-CONFIG_FILE = os.path.join(os.path.dirname(os.path.dirname(__file__)), "config.json")
+CONFIG_FILE = os.path.join(PROJECT_ROOT, "config.json")
 
 def read_config():
     config = {}
@@ -38,7 +39,7 @@ def read_config():
         "telegram_bot_token": get_val("telegram_bot_token", "TELEGRAM_BOT_TOKEN", ""),
         "telegram_chat_id": get_val("telegram_chat_id", "TELEGRAM_CHAT_ID", ""),
         "supabase_url": get_val("supabase_url", "SUPABASE_URL", ""),
-        "supabase_key": get_val("supabase_key", "SUPABASE_KEY", ""),
+        "supabase_key": os.getenv("SUPABASE_KEY") or os.getenv("SUPABASE_ANON_KEY") or config.get("supabase_key") or "",
         "supabase_service_role_key": get_val("supabase_service_role_key", "SUPABASE_SERVICE_ROLE_KEY", ""),
     }
     for key, value in config.items():

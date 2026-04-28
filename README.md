@@ -133,3 +133,4 @@ uv run python make_call.py --to +919988776655 (your number)
 - **No audio?**
     - Check OpenAI/Deepgram API keys.
     - Check the agent logs for errors.
+// redeploy fix 2026-04-28T09:37:18+05:30

@@ -63,7 +63,7 @@ export async function apiFetchWithFallback<T>(paths: string[], fallback: T): Pro
     try {
       return await apiFetch<T>(path);
     } catch (error) {
-      if (path === paths[paths.length - 1]) {
+      if (import.meta.env.DEV && path === paths[paths.length - 1]) {
         console.warn(`API fallback used after ${paths.join(", ")} failed`, error);
       }
     }

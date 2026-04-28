@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { useNavigate } from "react-router-dom";
-import { getAuthRedirectUrl, supabase } from "./lib/supabase";
+import { getAuthRedirectUrl, isSupabaseConfigured, supabase } from "./lib/supabase";
 
 function getErrorMessage(data: any, fallback: string) {
   if (typeof data?.detail === "string") return data.detail;
@@ -94,6 +94,12 @@ export default function Login() {
         <p className="text-gray-400 text-sm mb-6">
           {mode === "login" ? "Sign in to continue" : mode === "signup" ? "Create your account" : "Login with email OTP"}
         </p>
+        {!isSupabaseConfigured && (
+          <p className="text-amber-300 text-sm mb-4 rounded-lg border border-amber-700/60 bg-amber-950/40 px-3 py-2">
+            Auth is not configured: add <code className="text-amber-200">NEXT_PUBLIC_SUPABASE_URL</code> and{" "}
+            <code className="text-amber-200">NEXT_PUBLIC_SUPABASE_ANON_KEY</code> in Vercel, then redeploy.
+          </p>
+        )}
         <div className="space-y-4">
           <input
             type="email"

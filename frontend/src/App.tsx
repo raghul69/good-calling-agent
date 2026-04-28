@@ -61,6 +61,10 @@ function StatCardSkeleton() {
 function useScrollReveal() {
   useEffect(() => {
     const elements = Array.from(document.querySelectorAll<HTMLElement>('[data-reveal]'));
+    if (typeof IntersectionObserver === 'undefined') {
+      elements.forEach((element) => element.classList.add('is-visible'));
+      return;
+    }
     const observer = new IntersectionObserver(
       (entries) => {
         entries.forEach((entry) => {

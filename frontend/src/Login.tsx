@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { useNavigate } from "react-router-dom";
-import { apiUrl, setAccessToken } from "./auth";
+import { getAuthRedirectUrl, supabase } from "./lib/supabase";
 
 function getErrorMessage(data: any, fallback: string) {
   if (typeof data?.detail === "string") return data.detail;
@@ -25,15 +25,30 @@ export default function Login() {
     setMessage("");
     try {
       if (mode === "otp") {
-        const endpoint = otpSent ? "/api/auth/otp/verify" : "/api/auth/otp/send";
-        const res = await fetch(apiUrl(endpoint), {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(otpSent ? { email, token: otp } : { email }),
-        });
-        const data = await res.json();
-        if (!res.ok) {
-          const apiMessage = getErrorMessage(data, "OTP failed");
+        if (!otpSent) {
+          const { error } = await supabase.auth.signInWithOtp({
+            email,
+            options: { emailRedirectTo: getAuthRedirectUrl("/dashboard") },
+          });
+          if (error) {
+            const apiMessage = error.message || "OTP failed";
+            const waitMatch = apiMessage.match(/after\s+(\d+)\s+seconds/i);
+            if (waitMatch) {
+              setMessage(`Please wait ${waitMatch[1]} seconds before requesting another OTP.`);
+              setMessageTone("info");
+              return;
+            }
+            throw new Error(apiMessage);
+          }
+          setOtpSent(true);
+          setMessage("OTP sent. Check your email.");
+          setMessageTone("success");
+          return;
+        }
+
+        const { error } = await supabase.auth.verifyOtp({ email, token: otp, type: "email" });
+        if (error) {
+          const apiMessage = error.message || "OTP failed";
           const waitMatch = apiMessage.match(/after\s+(\d+)\s+seconds/i);
           if (waitMatch) {
             setMessage(`Please wait ${waitMatch[1]} seconds before requesting another OTP.`);
@@ -42,43 +57,25 @@ export default function Login() {
           }
           throw new Error(apiMessage);
         }
-        if (!otpSent) {
-          setOtpSent(true);
-          setMessage("OTP sent. Check your email.");
-          setMessageTone("success");
-          return;
-        }
-        if (!data?.access_token) {
-          throw new Error("No access token returned by server");
-        }
-        setAccessToken(data.access_token);
-        navigate("/");
+        navigate("/dashboard");
         return;
       }
 
-      const endpoint = mode === "login" ? "/api/auth/login" : "/api/auth/signup";
-      const res = await fetch(apiUrl(endpoint), {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ email, password }),
-      });
-      const data = await res.json();
-      if (!res.ok) {
-        throw new Error(getErrorMessage(data, "Authentication failed"));
-      }
-
       if (mode === "signup") {
-        setMode("login");
-        setMessage("Signup successful. Please log in.");
+        const { error } = await supabase.auth.signUp({
+          email,
+          password,
+          options: { emailRedirectTo: getAuthRedirectUrl("/dashboard") },
+        });
+        if (error) throw new Error(getErrorMessage(error, "Signup failed"));
+        setMessage("Signup successful. Check your email to confirm your account.");
         setMessageTone("success");
         return;
       }
 
-      if (!data?.access_token) {
-        throw new Error("No access token returned by server");
-      }
-      setAccessToken(data.access_token);
-      navigate("/");
+      const { error } = await supabase.auth.signInWithPassword({ email, password });
+      if (error) throw new Error(getErrorMessage(error, "Authentication failed"));
+      navigate("/dashboard");
     } catch (e: any) {
       setMessage(e.message || "Authentication failed");
       setMessageTone("error");

@@ -16,9 +16,19 @@ logger = logging.getLogger("backend-api")
 
 app = FastAPI(title="RapidX AI Dashboard API", version="2.0.0")
 
+
+def _cors_origins() -> list[str]:
+    configured = os.environ.get("CORS_ORIGIN") or os.environ.get("CORS_ORIGINS") or ""
+    origins = [origin.strip().rstrip("/") for origin in configured.split(",") if origin.strip()]
+    return origins or [
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+    ]
+
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], 
+    allow_origins=_cors_origins(),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -50,6 +60,11 @@ def health_check():
             "livekit": livekit_status,
         },
     }
+
+
+@app.get("/health")
+def health_check_root():
+    return health_check()
 
 # Provide some placeholder routes from old ui_server logic during transition
 # Allow running this file directly (`python backend/main.py`) and as module.

@@ -4,7 +4,8 @@ import { ArrowRight, ChartLineUp, CheckCircle, Gear, MicrophoneStage, PhoneCall,
 import VoiceTester from './VoiceTester';
 import TerminalPage from './Terminal';
 import Login from './Login';
-import { apiUrl, authFetch, clearAccessToken, getAccessToken } from './auth';
+import { clearAccessToken, getAccessToken } from './auth';
+import { api } from './lib/api';
 import heroAsset from './assets/hero.png';
 import './App.css';
 
@@ -57,70 +58,98 @@ function StatCardSkeleton() {
   );
 }
 
+function useScrollReveal() {
+  useEffect(() => {
+    const elements = Array.from(document.querySelectorAll<HTMLElement>('[data-reveal]'));
+    const observer = new IntersectionObserver(
+      (entries) => {
+        entries.forEach((entry) => {
+          if (entry.isIntersecting) {
+            entry.target.classList.add('is-visible');
+            observer.unobserve(entry.target);
+          }
+        });
+      },
+      { threshold: 0.18, rootMargin: '0px 0px -64px 0px' },
+    );
+    elements.forEach((element) => observer.observe(element));
+    return () => observer.disconnect();
+  }, []);
+}
+
+function JettoneLogo() {
+  return (
+    <span className="jettone-logo" aria-hidden="true">
+      <Waveform size={22} weight="bold" />
+    </span>
+  );
+}
+
 function LandingPage() {
+  useScrollReveal();
+
   const metrics = [
-    ['24/7', 'AI call coverage'],
-    ['12+', 'languages ready'],
-    ['< 2s', 'response latency'],
+    ['91%', 'faster first response'],
+    ['24/7', 'consumer call coverage'],
+    ['4.8/5', 'average caller rating'],
   ];
   const features = [
-    { title: 'Qualify every lead', copy: 'Bolona captures intent, budget, timeline, and contact details before your team wakes up.', Icon: PhoneCall },
-    { title: 'Book demos live', copy: 'Connect calendar logic, objection handling, and handoff notes into one voice workflow.', Icon: CheckCircle },
-    { title: 'Operate with context', copy: 'Workspace-aware logs, transcripts, recordings, and CRM-ready summaries stay organized.', Icon: ShieldCheck },
+    { title: 'Answer every shopper', copy: 'Jettone handles product questions, booking requests, delivery updates, and missed calls with a polished consumer voice.', Icon: PhoneCall },
+    { title: 'Resolve before handoff', copy: 'Collect the reason, verify intent, summarize the issue, and route only the calls that need your team.', Icon: CheckCircle },
+    { title: 'Protect the brand', copy: 'Guardrails, transcripts, sentiment, and escalation logic keep every customer interaction on-message.', Icon: ShieldCheck },
   ];
-  const integrations = ['Supabase', 'LiveKit', 'OpenAI', 'Sarvam', 'Calendar', 'CRM'];
+  const useCases = ['Appointments', 'Order status', 'Subscriptions', 'Local services', 'Healthcare intake', 'Home services'];
+  const integrations = ['Shopify', 'Stripe', 'Calendly', 'HubSpot', 'Zendesk', 'WhatsApp'];
 
   return (
-    <main className="min-h-screen bg-[#07100f] text-slate-100">
+    <main className="min-h-screen bg-[#05070b] text-slate-100">
       <section className="landing-hero relative min-h-[92svh] overflow-hidden border-b border-white/10">
         <img src={heroAsset} alt="" className="landing-hero-asset" />
         <div className="landing-grid" />
         <nav className="relative z-10 mx-auto flex w-full max-w-7xl items-center justify-between px-6 py-5">
-          <Link to="/" className="flex items-center gap-3" aria-label="Bolona AI home">
-            <span className="flex h-10 w-10 items-center justify-center rounded-lg bg-emerald-400 text-slate-950 shadow-lg shadow-emerald-950/30">
-              <Waveform size={22} weight="bold" />
-            </span>
+          <Link to="/" className="flex items-center gap-3" aria-label="Jettone home">
+            <JettoneLogo />
             <span>
-              <span className="block text-lg font-bold leading-none">Bolona AI</span>
-              <span className="block text-xs text-emerald-200/70">Conversation calling agents</span>
+              <span className="block text-lg font-black leading-none">Jettone</span>
+              <span className="block text-xs text-cyan-100/70">Consumer voice agents</span>
             </span>
           </Link>
           <div className="hidden items-center gap-8 text-sm text-slate-300 md:flex">
             <a href="#platform" className="hover:text-white">Platform</a>
-            <a href="#use-cases" className="hover:text-white">Use cases</a>
-            <a href="#integrations" className="hover:text-white">Integrations</a>
+            <a href="#consumer" className="hover:text-white">B2C workflows</a>
+            <a href="#integrations" className="hover:text-white">Stack</a>
           </div>
           <div className="flex items-center gap-3">
             <Link to="/login" className="rounded-lg px-4 py-2 text-sm font-semibold text-slate-200 hover:bg-white/10">Login</Link>
-            <Link to="/login" className="hidden rounded-lg bg-emerald-300 px-4 py-2 text-sm font-bold text-slate-950 shadow-lg shadow-emerald-950/30 hover:bg-emerald-200 sm:inline-flex">
-              Start
+            <Link to="/login" className="hidden rounded-lg bg-cyan-300 px-4 py-2 text-sm font-bold text-slate-950 shadow-lg shadow-cyan-950/30 hover:bg-cyan-200 sm:inline-flex">
+              Launch agent
             </Link>
           </div>
         </nav>
 
         <div className="relative z-10 mx-auto grid min-h-[calc(92svh-82px)] w-full max-w-7xl items-center gap-10 px-6 pb-12 pt-4 lg:grid-cols-[1fr_0.95fr]">
-          <div className="max-w-3xl">
-            <div className="mb-5 inline-flex items-center gap-2 rounded-full border border-emerald-300/25 bg-emerald-300/10 px-3 py-1 text-sm text-emerald-100">
+          <div className="max-w-3xl" data-reveal>
+            <div className="mb-5 inline-flex items-center gap-2 rounded-full border border-cyan-300/25 bg-cyan-300/10 px-3 py-1 text-sm text-cyan-100">
               <Sparkle size={16} weight="fill" />
-              AI voice agents for sales, support, and bookings
+              Billion-dollar voice layer for consumer brands
             </div>
             <h1 className="max-w-4xl text-5xl font-black leading-[1.02] tracking-normal text-white md:text-7xl">
-              Bolona AI tools for conversations that close the loop.
+              Jettone turns every consumer call into a premium customer moment.
             </h1>
             <p className="mt-6 max-w-2xl text-lg leading-8 text-slate-300">
-              Launch calling agents that answer, qualify, book, transfer, and summarize every customer conversation with your playbook, your voice stack, and your CRM data.
+              AI calling agents for clinics, salons, local services, ecommerce, and subscription businesses that need fast, human-grade conversations at consumer scale.
             </p>
             <div className="mt-8 flex flex-col gap-3 sm:flex-row">
-              <Link to="/login" className="inline-flex items-center justify-center gap-2 rounded-lg bg-emerald-300 px-5 py-3 font-bold text-slate-950 shadow-xl shadow-emerald-950/30 hover:bg-emerald-200">
-                Build your agent <ArrowRight size={18} weight="bold" />
+              <Link to="/login" className="inline-flex items-center justify-center gap-2 rounded-lg bg-cyan-300 px-5 py-3 font-bold text-slate-950 shadow-xl shadow-cyan-950/30 hover:bg-cyan-200">
+                Build Jettone <ArrowRight size={18} weight="bold" />
               </Link>
               <Link to="/login" className="inline-flex items-center justify-center gap-2 rounded-lg border border-white/15 bg-white/5 px-5 py-3 font-semibold text-white hover:bg-white/10">
-                <PlayCircle size={20} weight="fill" /> Try live demo
+                <PlayCircle size={20} weight="fill" /> Hear the agent
               </Link>
             </div>
             <div className="mt-10 grid max-w-2xl grid-cols-3 gap-3">
               {metrics.map(([value, label]) => (
-                <div key={label} className="border-l border-emerald-300/40 pl-4">
+                <div key={label} className="border-l border-cyan-300/40 pl-4">
                   <div className="text-2xl font-black text-white">{value}</div>
                   <div className="mt-1 text-sm text-slate-400">{label}</div>
                 </div>
@@ -128,46 +157,46 @@ function LandingPage() {
             </div>
           </div>
 
-          <div className="landing-console relative mx-auto w-full max-w-lg rounded-xl border border-white/12 bg-slate-950/72 p-4 shadow-2xl shadow-black/40 backdrop-blur">
+          <div className="landing-console relative mx-auto w-full max-w-lg rounded-xl border border-white/12 bg-slate-950/72 p-4 shadow-2xl shadow-black/40 backdrop-blur" data-reveal>
             <div className="mb-4 flex items-center justify-between border-b border-white/10 pb-3">
               <div>
-                <p className="text-xs uppercase text-emerald-200/70">Live agent</p>
-                <p className="font-semibold text-white">Inbound demo call</p>
+                <p className="text-xs uppercase text-cyan-200/70">Live consumer call</p>
+                <p className="font-semibold text-white">Jettone Concierge</p>
               </div>
-              <span className="inline-flex items-center gap-2 rounded-full bg-emerald-300/10 px-3 py-1 text-xs font-semibold text-emerald-200">
-                <span className="h-2 w-2 rounded-full bg-emerald-300" /> Connected
+              <span className="inline-flex items-center gap-2 rounded-full bg-cyan-300/10 px-3 py-1 text-xs font-semibold text-cyan-200">
+                <span className="h-2 w-2 rounded-full bg-cyan-300" /> Live
               </span>
             </div>
             <div className="space-y-3">
               <div className="max-w-[82%] rounded-lg bg-white/8 p-3 text-sm text-slate-200">
-                Need an AI caller for my clinic leads. Can it book appointments?
+                I missed a call. Can I still book a skin consultation for tomorrow?
               </div>
-              <div className="ml-auto max-w-[86%] rounded-lg bg-emerald-300 p-3 text-sm font-medium text-slate-950">
-                Yes. I can qualify the lead, check the calendar, book a slot, and send your team the summary.
+              <div className="ml-auto max-w-[86%] rounded-lg bg-cyan-300 p-3 text-sm font-medium text-slate-950">
+                Absolutely. I found two openings, confirmed your preferences, and can reserve the 4:30 slot now.
               </div>
               <div className="rounded-lg border border-white/10 bg-black/25 p-3">
                 <div className="mb-3 flex items-center justify-between text-xs text-slate-400">
-                  <span>Call intelligence</span>
-                  <MicrophoneStage size={18} className="text-emerald-200" />
+                  <span>Consumer intelligence</span>
+                  <MicrophoneStage size={18} className="text-cyan-200" />
                 </div>
                 <div className="grid grid-cols-3 gap-2 text-center text-xs">
                   <div className="rounded-md bg-white/7 p-2">
-                    <p className="text-slate-400">Intent</p>
-                    <p className="mt-1 font-bold text-white">High</p>
+                    <p className="text-slate-400">Mood</p>
+                    <p className="mt-1 font-bold text-white">Ready</p>
                   </div>
                   <div className="rounded-md bg-white/7 p-2">
-                    <p className="text-slate-400">Stage</p>
-                    <p className="mt-1 font-bold text-white">Demo</p>
+                    <p className="text-slate-400">Need</p>
+                    <p className="mt-1 font-bold text-white">Book</p>
                   </div>
                   <div className="rounded-md bg-white/7 p-2">
                     <p className="text-slate-400">Action</p>
-                    <p className="mt-1 font-bold text-white">Book</p>
+                    <p className="mt-1 font-bold text-white">Confirm</p>
                   </div>
                 </div>
               </div>
               <div className="flex h-12 items-end gap-1 rounded-lg bg-black/25 px-3 py-2" aria-hidden="true">
                 {[18, 28, 14, 38, 24, 42, 16, 34, 26, 44, 18, 30, 20, 36, 22, 40].map((height, index) => (
-                  <span key={index} className="w-full rounded-t bg-emerald-300/80" style={{ height }} />
+                  <span key={index} className="voice-bar w-full rounded-t bg-cyan-300/80" style={{ height, animationDelay: `${index * 70}ms` }} />
                 ))}
               </div>
             </div>
@@ -175,16 +204,16 @@ function LandingPage() {
         </div>
       </section>
 
-      <section id="platform" className="bg-[#f5f7ef] px-6 py-16 text-slate-950">
-        <div className="mx-auto max-w-7xl">
+      <section id="platform" className="bg-[#f7f8fb] px-6 py-20 text-slate-950">
+        <div className="mx-auto max-w-7xl" data-reveal>
           <div className="mb-10 max-w-2xl">
-            <p className="mb-3 text-sm font-bold uppercase text-emerald-700">Platform</p>
-            <h2 className="text-3xl font-black tracking-normal md:text-5xl">From phone call to pipeline record.</h2>
+            <p className="mb-3 text-sm font-bold uppercase text-cyan-700">Platform</p>
+            <h2 className="text-3xl font-black tracking-normal md:text-5xl">A voice agent built for people buying, booking, asking, and deciding.</h2>
           </div>
           <div className="grid gap-4 md:grid-cols-3">
             {features.map(({ title, copy, Icon }) => (
               <article key={title} className="rounded-lg border border-slate-200 bg-white p-6 shadow-sm">
-                <Icon size={28} weight="duotone" className="mb-5 text-emerald-700" />
+                <Icon size={28} weight="duotone" className="mb-5 text-cyan-700" />
                 <h3 className="text-xl font-bold">{title}</h3>
                 <p className="mt-3 leading-7 text-slate-600">{copy}</p>
               </article>
@@ -193,16 +222,16 @@ function LandingPage() {
         </div>
       </section>
 
-      <section id="use-cases" className="bg-white px-6 py-16 text-slate-950">
-        <div className="mx-auto grid max-w-7xl gap-8 lg:grid-cols-[0.9fr_1.1fr]">
+      <section id="consumer" className="bg-white px-6 py-20 text-slate-950">
+        <div className="mx-auto grid max-w-7xl gap-8 lg:grid-cols-[0.9fr_1.1fr]" data-reveal>
           <div>
-            <p className="mb-3 text-sm font-bold uppercase text-emerald-700">Use cases</p>
-            <h2 className="text-3xl font-black tracking-normal md:text-5xl">One calling OS for the work your team keeps repeating.</h2>
+            <p className="mb-3 text-sm font-bold uppercase text-cyan-700">B2C only</p>
+            <h2 className="text-3xl font-black tracking-normal md:text-5xl">No enterprise clutter. Just calls that make consumers feel handled.</h2>
           </div>
           <div className="grid gap-3 sm:grid-cols-2">
-            {['Inbound lead response', 'Outbound follow-up', 'Demo booking', 'Missed-call recovery', 'Customer support triage', 'Human handoff'].map((item) => (
+            {useCases.map((item) => (
               <div key={item} className="flex items-center gap-3 rounded-lg border border-slate-200 bg-slate-50 p-4 font-semibold">
-                <CheckCircle size={21} weight="fill" className="text-emerald-600" />
+                <CheckCircle size={21} weight="fill" className="text-cyan-600" />
                 {item}
               </div>
             ))}
@@ -210,11 +239,11 @@ function LandingPage() {
         </div>
       </section>
 
-      <section id="integrations" className="bg-[#07100f] px-6 py-16 text-white">
-        <div className="mx-auto flex max-w-7xl flex-col gap-8 md:flex-row md:items-center md:justify-between">
+      <section id="integrations" className="bg-[#05070b] px-6 py-20 text-white">
+        <div className="mx-auto flex max-w-7xl flex-col gap-8 md:flex-row md:items-center md:justify-between" data-reveal>
           <div className="max-w-xl">
-            <p className="mb-3 text-sm font-bold uppercase text-emerald-200">Integrations</p>
-            <h2 className="text-3xl font-black tracking-normal md:text-5xl">Bring your current stack. Bolona runs the call layer.</h2>
+            <p className="mb-3 text-sm font-bold uppercase text-cyan-200">Connected stack</p>
+            <h2 className="text-3xl font-black tracking-normal md:text-5xl">Jettone fits beside the tools consumer teams already run.</h2>
           </div>
           <div className="grid w-full max-w-xl grid-cols-2 gap-3 sm:grid-cols-3">
             {integrations.map((item) => (
@@ -237,8 +266,7 @@ function Dashboard() {
   useEffect(() => {
     (async () => {
       try {
-        const h = await fetch(apiUrl('/api/health'));
-        if (h.ok) setHealth(await h.json());
+        setHealth(await api.health());
       } catch {
         setHealth({});
       }
@@ -249,9 +277,7 @@ function Dashboard() {
     (async () => {
       setStatsLoading(true);
       try {
-        const res = await authFetch('/api/stats');
-        if (!res.ok) return;
-        setStats(await res.json());
+        setStats(await api.analytics());
       } finally {
         setStatsLoading(false);
       }
@@ -319,10 +345,7 @@ function CallLogs() {
   const [rows, setRows] = useState<any[]>([]);
   useEffect(() => {
     (async () => {
-      const res = await authFetch('/api/logs');
-      if (!res.ok) return;
-      const data = await res.json();
-      setRows(Array.isArray(data) ? data : []);
+      setRows(await api.calls());
     })();
   }, []);
 
@@ -347,10 +370,7 @@ function Crm() {
   const [rows, setRows] = useState<any[]>([]);
   useEffect(() => {
     (async () => {
-      const res = await authFetch('/api/contacts');
-      if (!res.ok) return;
-      const data = await res.json();
-      setRows(Array.isArray(data) ? data : []);
+      setRows(await api.contacts());
     })();
   }, []);
 
@@ -377,21 +397,18 @@ function Settings() {
 
   useEffect(() => {
     (async () => {
-      const res = await authFetch('/api/config');
-      if (!res.ok) return;
-      setConfig(await res.json());
+      setConfig(await api.config());
     })();
   }, []);
 
   const onSave = async () => {
     setMessage('');
-    const res = await authFetch('/api/config', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(config),
-    });
-    const data = await res.json();
-    setMessage(res.ok ? 'Config saved.' : data?.detail || 'Failed to save config.');
+    try {
+      await api.saveConfig(config);
+      setMessage('Config saved.');
+    } catch (error: any) {
+      setMessage(error?.message || 'Failed to save config.');
+    }
   };
 
   return (
@@ -423,6 +440,70 @@ function Settings() {
   );
 }
 
+function ResourceList({ title, loader, emptyText }: { title: string; loader: () => Promise<any[]>; emptyText: string }) {
+  const [rows, setRows] = useState<any[]>([]);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    (async () => {
+      try {
+        setRows(await loader());
+      } finally {
+        setLoading(false);
+      }
+    })();
+  }, [loader]);
+
+  return (
+    <div className="page p-8">
+      <h1 className="text-2xl font-bold mb-4">{title}</h1>
+      {loading ? (
+        <p className="text-gray-400">Loading...</p>
+      ) : rows.length ? (
+        <div className="space-y-3">
+          {rows.slice(0, 50).map((row, index) => (
+            <pre key={row.id || index} className="overflow-auto rounded-xl border border-gray-700 bg-gray-800 p-4 text-xs text-gray-200">
+              {JSON.stringify(row, null, 2)}
+            </pre>
+          ))}
+        </div>
+      ) : (
+        <p className="text-gray-400">{emptyText}</p>
+      )}
+    </div>
+  );
+}
+
+function Agents() {
+  return <ResourceList title="Agents" loader={api.agents} emptyText="No agents returned by /api/agents yet." />;
+}
+
+function Campaigns() {
+  return <ResourceList title="Campaigns" loader={api.campaigns} emptyText="No campaigns returned by /api/campaigns yet." />;
+}
+
+function Analytics() {
+  const [stats, setStats] = useState<{ total_calls: number; total_bookings: number; avg_duration: number; booking_rate: number } | null>(null);
+
+  useEffect(() => {
+    (async () => {
+      setStats(await api.analytics());
+    })();
+  }, []);
+
+  return (
+    <div className="page p-8">
+      <h1 className="text-2xl font-bold mb-4">Analytics</h1>
+      <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
+        <StatCard label="Total Calls" value={stats?.total_calls} />
+        <StatCard label="Bookings" value={stats?.total_bookings} />
+        <StatCard label="Avg Duration (s)" value={stats?.avg_duration} />
+        <StatCard label="Booking Rate (%)" value={stats?.booking_rate} />
+      </div>
+    </div>
+  );
+}
+
 function SidebarLink({ to, icon: Icon, children }: { to: string, icon: any, children: React.ReactNode }) {
   const location = useLocation();
   const isActive = location.pathname === to;
@@ -447,8 +528,11 @@ function Layout({ children }: { children: React.ReactNode }) {
         </div>
         <div className="flex-1 py-4 flex flex-col gap-1">
           <SidebarLink to="/dashboard" icon={ChartLineUp}>Dashboard</SidebarLink>
+          <SidebarLink to="/agents" icon={Users}>Agents</SidebarLink>
           <SidebarLink to="/terminal" icon={TerminalWindow}>Terminal Logs</SidebarLink>
-          <SidebarLink to="/logs" icon={PhoneCall}>Call History</SidebarLink>
+          <SidebarLink to="/logs" icon={PhoneCall}>Calls</SidebarLink>
+          <SidebarLink to="/campaigns" icon={PlayCircle}>Campaigns</SidebarLink>
+          <SidebarLink to="/analytics" icon={ChartLineUp}>Analytics</SidebarLink>
           <SidebarLink to="/crm" icon={Users}>CRM Contacts</SidebarLink>
           <SidebarLink to="/settings" icon={Gear}>Settings</SidebarLink>
         </div>
@@ -473,7 +557,21 @@ function Layout({ children }: { children: React.ReactNode }) {
 }
 
 function ProtectedRoute({ children }: { children: React.ReactNode }) {
-  if (!getAccessToken()) {
+  const [loading, setLoading] = useState(true);
+  const [authenticated, setAuthenticated] = useState(false);
+
+  useEffect(() => {
+    (async () => {
+      setAuthenticated(Boolean(await getAccessToken()));
+      setLoading(false);
+    })();
+  }, []);
+
+  if (loading) {
+    return <div className="min-h-screen bg-gray-900 text-gray-300 p-8">Loading...</div>;
+  }
+
+  if (!authenticated) {
     return <Navigate to="/login" replace />;
   }
   return <>{children}</>;
@@ -492,8 +590,11 @@ function App() {
               <Layout>
                 <Routes>
                   <Route path="/dashboard" element={<Dashboard />} />
+                  <Route path="/agents" element={<Agents />} />
                   <Route path="/terminal" element={<TerminalPage />} />
                   <Route path="/logs" element={<CallLogs />} />
+                  <Route path="/campaigns" element={<Campaigns />} />
+                  <Route path="/analytics" element={<Analytics />} />
                   <Route path="/crm" element={<Crm />} />
                   <Route path="/settings" element={<Settings />} />
                   <Route path="*" element={<Navigate to="/dashboard" replace />} />

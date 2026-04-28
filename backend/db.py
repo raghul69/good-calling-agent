@@ -12,7 +12,7 @@ def _supabase_settings(service_role: bool = False) -> tuple[str, str]:
     url = os.getenv("SUPABASE_URL", "").strip()
     anon_key = (os.getenv("SUPABASE_KEY") or os.getenv("SUPABASE_ANON_KEY") or "").strip()
     service_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "").strip()
-    key = service_key if service_role and service_key else anon_key
+    key = service_key if service_role and service_key else anon_key or service_key
     return url, key
 
 

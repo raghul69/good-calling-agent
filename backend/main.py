@@ -20,10 +20,14 @@ app = FastAPI(title="RapidX AI Dashboard API", version="2.0.0")
 def _cors_origins() -> list[str]:
     configured = os.environ.get("CORS_ORIGIN") or os.environ.get("CORS_ORIGINS") or ""
     origins = [origin.strip().rstrip("/") for origin in configured.split(",") if origin.strip()]
-    return origins or [
+    defaults = [
+        "https://good-calling-agent.vercel.app",
+        "https://good-calling-agent-jettones-projects.vercel.app",
+        "https://good-calling-agent-git-main-jettones-projects.vercel.app",
         "http://localhost:3000",
         "http://127.0.0.1:3000",
     ]
+    return list(dict.fromkeys([*origins, *defaults]))
 
 
 app.add_middleware(

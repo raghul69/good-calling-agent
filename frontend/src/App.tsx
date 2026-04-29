@@ -1,11 +1,50 @@
 import { useEffect, useState } from 'react';
 import { BrowserRouter, Routes, Route, Link, useLocation, Navigate, useNavigate } from 'react-router-dom';
-import { ArrowRight, ChartLineUp, CheckCircle, Gear, MicrophoneStage, PhoneCall, PlayCircle, ShieldCheck, Sparkle, TerminalWindow, Users, Waveform } from '@phosphor-icons/react';
+import {
+  ArrowRight,
+  ArrowSquareOut,
+  BookOpen,
+  CaretUpDown,
+  ChartLineUp,
+  ChatCircleText,
+  CheckCircle,
+  Code,
+  Copy,
+  CreditCard,
+  Database,
+  DownloadSimple,
+  FileText,
+  Flask,
+  FloppyDisk,
+  Gear,
+  GitBranch,
+  Hash,
+  Info,
+  ListBullets,
+  MagnifyingGlass,
+  MicrophoneStage,
+  PhoneCall,
+  PhoneIncoming,
+  PlayCircle,
+  Plus,
+  PlugsConnected,
+  ShareNetwork,
+  ShieldCheck,
+  Sparkle,
+  Stack,
+  TerminalWindow,
+  Trash,
+  Translate,
+  Users,
+  Waveform,
+  Wrench,
+} from '@phosphor-icons/react';
 import VoiceTester from './VoiceTester';
 import TerminalPage from './Terminal';
 import Login from './Login';
 import { clearAccessToken, getAccessToken } from './auth';
-import { api } from './lib/api';
+import { api, apiConnectionMessage, isApiConfigured, type AnalyticsSummary, type BillingSummary, type Campaign, type CurrentUser, type WorkspaceSummary } from './lib/api';
+import { supabase } from './lib/supabase';
 import heroAsset from './assets/hero.png';
 import './App.css';
 
@@ -45,15 +84,6 @@ function IntegrationPills({ health }: { health: HealthPayload | null }) {
       {pill('Supabase', ok(health.supabase_configured))}
       {pill('Service role', ok(health.service_role_key_present))}
       {pill('LiveKit', ok(health.livekit_configured))}
-    </div>
-  );
-}
-
-function StatCardSkeleton() {
-  return (
-    <div className="card bg-gray-800/80 p-4 rounded-xl border border-gray-700 animate-pulse">
-      <div className="h-3 w-24 rounded bg-gray-700 mb-3" />
-      <div className="h-8 w-16 rounded bg-gray-700" />
     </div>
   );
 }
@@ -262,8 +292,294 @@ function LandingPage() {
   );
 }
 
+type DemoAgent = {
+  id: string;
+  name: string;
+  status: string;
+  phone: string;
+  welcomeMessage: string;
+  prompt: string;
+};
+
+const demoAgents: DemoAgent[] = [
+  {
+    id: 'maxrindia',
+    name: 'maxrindia',
+    status: 'Active',
+    phone: '+918065480786',
+    welcomeMessage: 'வணக்கம்! keystone Real Estate-க்கு அழைத்ததற்கு நன்றி, நான் sajitha பேசுகிறேன், நீங்கள் எப்படிச் உதவி வேண்டும்?',
+    prompt:
+      'நீங்கள் shajitha, Keystone real Estate-ல் இருந்து பேசும் ஒரு நட்பான மற்றும் professional inbound real estate assistant.\n\nWelcome\nநன்றி Keystone Estateக்கு call பண்ணதுக்கு. நீங்கள் Chennaiல property வாங்க அல்லது rent செய்ய பார்க்கிறீங்களா?\n\nGoals\n- Caller name, phone, location preference, budget, property type collect செய்யவும்.\n- Site visit அல்லது callback book செய்யவும்.\n- If caller asks for human, transfer politely.\n\nStyle\nTamil primary, clear short sentences, warm tone, no long monologues.',
+  },
+  {
+    id: 'real-estate-sales-agent',
+    name: 'real estate sales agent',
+    status: 'Active',
+    phone: '+919876543210',
+    welcomeMessage: 'Hi, thanks for calling Keystone Real Estate. I can help you with property details, pricing, and site visits.',
+    prompt:
+      'You are a professional real estate sales assistant. Qualify buyer intent, collect location and budget, answer common questions, and book a site visit.',
+  },
+  {
+    id: 'my-new-agent',
+    name: 'My New Agent',
+    status: 'Draft',
+    phone: '+910000000000',
+    welcomeMessage: 'Hello, thanks for calling. How can I help you today?',
+    prompt: 'You are a helpful voice agent. Keep replies short, natural, and useful.',
+  },
+];
+
+const agentTabs = [
+  ['Agent', FileText],
+  ['LLM', Gear],
+  ['Audio', Translate],
+  ['Engine', Wrench],
+  ['Call', PhoneCall],
+  ['Tools', Code],
+  ['Analytics', ChartLineUp],
+  ['Inbound', PhoneIncoming],
+] as const;
+
+function ShellButton({ children, primary = false, danger = false, className = '', onClick }: { children: React.ReactNode; primary?: boolean; danger?: boolean; className?: string; onClick?: () => void }) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className={`inline-flex min-h-10 items-center justify-center gap-2 rounded-md border px-4 text-sm font-semibold shadow-sm transition ${
+        primary
+          ? 'border-blue-600 bg-blue-600 text-white hover:bg-blue-700'
+          : danger
+            ? 'border-slate-200 bg-white text-slate-900 hover:border-red-200 hover:bg-red-50 hover:text-red-700'
+            : 'border-slate-200 bg-white text-slate-950 hover:bg-slate-50'
+      } ${className}`}
+    >
+      {children}
+    </button>
+  );
+}
+
+function AppPanel({ title, icon: Icon, children, action }: { title: string; icon?: any; children: React.ReactNode; action?: React.ReactNode }) {
+  return (
+    <section className="rounded-lg border border-slate-200 bg-white p-6 shadow-sm">
+      <div className="mb-4 flex items-center justify-between gap-4">
+        <h2 className="flex items-center gap-2 text-lg font-bold text-slate-950">
+          {Icon && <Icon size={19} className="text-slate-400" />}
+          {title}
+          <Info size={16} className="text-slate-400" />
+        </h2>
+        {action}
+      </div>
+      {children}
+    </section>
+  );
+}
+
+function Agents() {
+  const [agents, setAgents] = useState<DemoAgent[]>(demoAgents);
+  const [selectedId, setSelectedId] = useState(demoAgents[0].id);
+  const [search, setSearch] = useState('');
+  const [activeTab, setActiveTab] = useState('Agent');
+  const [saved, setSaved] = useState(false);
+
+  useEffect(() => {
+    (async () => {
+      const rows = await api.agents();
+      if (!rows.length) return;
+      setAgents((current) => {
+        const mapped = rows.map((row: any, index: number) => ({
+          id: row.id || `agent-${index}`,
+          name: row.name || row.config?.name || `Agent ${index + 1}`,
+          status: row.status || 'Active',
+          phone: row.phone || row.config?.phone || '+918065480786',
+          welcomeMessage: row.config?.welcomeMessage || row.config?.first_line || demoAgents[0].welcomeMessage,
+          prompt: row.config?.prompt || row.config?.agent_instructions || demoAgents[0].prompt,
+        }));
+        setSelectedId(mapped[0]?.id || current[0].id);
+        return mapped;
+      });
+    })();
+  }, []);
+
+  const selected = agents.find((agent) => agent.id === selectedId) || agents[0];
+  const filtered = agents.filter((agent) => agent.name.toLowerCase().includes(search.toLowerCase()));
+  const updateSelected = (fields: Partial<DemoAgent>) => {
+    setSaved(false);
+    setAgents((current) => current.map((agent) => (agent.id === selected.id ? { ...agent, ...fields } : agent)));
+  };
+
+  return (
+    <div className="min-h-full bg-slate-50 px-6 py-4 text-slate-950">
+      <p className="mb-5 text-sm text-slate-600">Fine tune your agents</p>
+      <div className="grid h-[calc(100vh-56px)] min-h-[720px] grid-cols-[376px_minmax(620px,1fr)_304px] overflow-hidden rounded-lg border border-slate-200 bg-white shadow-xl shadow-slate-200/70">
+        <aside className="border-r border-slate-200 bg-white">
+          <div className="border-b border-slate-200 p-5">
+            <h1 className="mb-3 text-2xl font-black text-slate-950">Your Agents</h1>
+            <div className="flex gap-3">
+              <ShellButton><DownloadSimple size={18} /> Import</ShellButton>
+              <ShellButton><Plus size={18} /> New Agent</ShellButton>
+            </div>
+          </div>
+          <div className="space-y-3 p-5">
+            <label className="flex items-center gap-3 rounded-md border border-slate-200 bg-white px-4 py-3 text-slate-500 shadow-sm">
+              <MagnifyingGlass size={21} />
+              <input
+                value={search}
+                onChange={(event) => setSearch(event.target.value)}
+                className="w-full bg-transparent text-base text-slate-900 outline-none placeholder:text-slate-400"
+                placeholder="Search agents..."
+              />
+            </label>
+            {filtered.map((agent) => (
+              <button
+                key={agent.id}
+                type="button"
+                onClick={() => setSelectedId(agent.id)}
+                className={`w-full rounded-lg border px-4 py-4 text-left text-base font-semibold transition ${
+                  selected.id === agent.id ? 'border-slate-300 bg-slate-100' : 'border-slate-200 bg-white hover:bg-slate-50'
+                }`}
+              >
+                {agent.name}
+              </button>
+            ))}
+          </div>
+        </aside>
+
+        <main className="overflow-y-auto bg-white p-5">
+          <section className="rounded-lg border border-slate-200 bg-white p-6 shadow-sm">
+            <div className="grid grid-cols-[minmax(280px,1fr)_auto_auto] items-center gap-7">
+              <input
+                value={selected.name}
+                onChange={(event) => updateSelected({ name: event.target.value })}
+                className="h-12 rounded-md border border-transparent bg-white text-4xl font-normal text-slate-950 outline-none shadow-sm focus:border-slate-200"
+              />
+              <ShellButton><Copy size={20} /> Agent ID</ShellButton>
+              <ShellButton><ShareNetwork size={20} /> Share</ShellButton>
+            </div>
+            <div className="mt-5 grid grid-cols-[minmax(340px,520px)_1fr] items-start gap-6">
+              <div>
+                <p className="mb-2 flex items-center gap-2 text-sm text-slate-900"><Info size={16} /> Cost per min: ~ $0.067</p>
+                <div className="flex h-3 overflow-hidden rounded-full bg-slate-200">
+                  <span className="w-[18%] bg-teal-500" />
+                  <span className="w-[22%] bg-orange-500" />
+                  <span className="w-[47%] bg-slate-700" />
+                  <span className="w-[13%] bg-blue-600" />
+                </div>
+                <div className="mt-3 flex flex-wrap gap-4 text-sm text-slate-600">
+                  {['Transcriber', 'LLM', 'Voice', 'Telephony', 'Platform'].map((item, index) => (
+                    <span key={item} className="flex items-center gap-2">
+                      <span className={`h-2.5 w-2.5 rounded-full ${['bg-teal-500', 'bg-orange-500', 'bg-slate-700', 'bg-amber-400', 'bg-blue-600'][index]}`} />
+                      {item}
+                    </span>
+                  ))}
+                </div>
+              </div>
+              <p className="flex items-center gap-2 text-sm text-slate-500"><Info size={16} /> India routing</p>
+            </div>
+          </section>
+
+          <div className="my-5 grid grid-cols-8 rounded-lg bg-slate-100 p-1">
+            {agentTabs.map(([label, Icon]) => (
+              <button
+                key={label}
+                type="button"
+                onClick={() => setActiveTab(label)}
+                className={`flex min-h-14 flex-col items-center justify-center gap-1 rounded-md text-sm font-semibold transition ${
+                  activeTab === label ? 'bg-white text-blue-600 shadow-sm' : 'text-slate-700 hover:bg-white/60'
+                }`}
+              >
+                <Icon size={20} />
+                {label}
+              </button>
+            ))}
+          </div>
+
+          {activeTab === 'Agent' ? (
+            <div className="space-y-5">
+              <AppPanel title="Agent Welcome Message" icon={ChatCircleText}>
+                <input
+                  value={selected.welcomeMessage}
+                  onChange={(event) => updateSelected({ welcomeMessage: event.target.value })}
+                  className="w-full rounded-md border border-slate-200 px-4 py-3 text-lg text-slate-950 shadow-inner outline-none focus:border-blue-400"
+                />
+                <p className="mt-2 text-sm text-slate-500">You can define variables using {'{variable_name}'}</p>
+              </AppPanel>
+              <AppPanel
+                title="Agent Prompt"
+                icon={FileText}
+                action={<ShellButton><Gear size={17} /> AI Edit</ShellButton>}
+              >
+                <div className="mb-5 flex flex-wrap gap-2">
+                  <button type="button" className="rounded-md bg-blue-600 px-4 py-2 text-sm font-bold text-white">Tamil (Primary)</button>
+                  <ShellButton><Plus size={17} /> Add Language</ShellButton>
+                </div>
+                <textarea
+                  value={selected.prompt}
+                  onChange={(event) => updateSelected({ prompt: event.target.value })}
+                  className="h-72 w-full resize-none rounded-md border border-slate-200 bg-white p-4 text-lg leading-7 text-slate-950 outline-none focus:border-blue-400"
+                />
+              </AppPanel>
+            </div>
+          ) : (
+            <AppPanel title={`${activeTab} Settings`} icon={SlidersIcon}>
+              <div className="grid gap-4 md:grid-cols-2">
+                <SettingField label={`${activeTab} model`} value="Production default" />
+                <SettingField label="Fallback behavior" value="Escalate to human" />
+                <SettingField label="Response style" value="Short, warm, professional" />
+                <SettingField label="Status" value="Enabled" />
+              </div>
+            </AppPanel>
+          )}
+        </main>
+
+        <aside className="space-y-5 border-l border-slate-200 bg-white p-4">
+          <div className="rounded-lg border border-slate-200 p-4">
+            <ShellButton primary className="mb-4 w-full"><PhoneIncoming size={20} /> Get call from agent</ShellButton>
+            <div className="mb-2 flex items-center justify-between gap-2">
+              <div className="flex min-h-11 flex-1 items-center gap-2 rounded-md bg-slate-100 px-3 font-bold">
+                <PhoneCall size={20} />
+                {selected.phone}
+              </div>
+              <ShellButton className="px-3"><Gear size={19} /></ShellButton>
+            </div>
+            <button type="button" className="w-full text-right text-sm text-blue-600">Purchase phone numbers <ArrowSquareOut size={12} className="inline" /></button>
+          </div>
+
+          <div className="rounded-lg border border-slate-200 p-4">
+            <ShellButton className="mb-5 w-full text-base">See all call logs <ArrowSquareOut size={20} /></ShellButton>
+            <div className="grid grid-cols-[1fr_auto] gap-2">
+              <ShellButton primary onClick={() => { setSaved(true); }}><FloppyDisk size={20} /> {saved ? 'Saved' : 'Save agent'}</ShellButton>
+              <ShellButton danger className="px-3"><Trash size={20} /></ShellButton>
+            </div>
+            <p className="mt-3 border-b border-slate-200 pb-5 text-sm italic text-slate-500">Updated 8 days ago</p>
+            <ShellButton className="mt-6 w-full bg-slate-100 text-blue-600"><ChatCircleText size={20} /> Chat with agent</ShellButton>
+            <p className="mt-3 text-center text-sm text-slate-500">Chat is the fastest way to test and refine.</p>
+            <div className="mt-6 rounded-lg border border-dashed border-slate-300 p-4 text-center">
+              <ShellButton className="w-full border-dashed"><Flask size={20} /> Test via browser <span className="rounded bg-slate-100 px-2 py-1 text-xs text-slate-500">BETA</span></ShellButton>
+              <p className="mt-3 text-xs text-slate-500">For best experience, use "Get call from agent"</p>
+            </div>
+          </div>
+        </aside>
+      </div>
+    </div>
+  );
+}
+
+function SlidersIcon({ size = 20, className = '' }: { size?: number; className?: string }) {
+  return <Gear size={size} className={className} />;
+}
+
+function SettingField({ label, value }: { label: string; value: string }) {
+  return (
+    <label className="block">
+      <span className="text-sm font-medium text-slate-600">{label}</span>
+      <input className="mt-2 w-full rounded-md border border-slate-200 px-3 py-2 text-slate-900 outline-none focus:border-blue-400" defaultValue={value} />
+    </label>
+  );
+}
+
 function Dashboard() {
-  const [stats, setStats] = useState<{ total_calls: number; total_bookings: number; avg_duration: number; booking_rate: number } | null>(null);
+  const [stats, setStats] = useState<AnalyticsSummary | null>(null);
   const [statsLoading, setStatsLoading] = useState(true);
   const [health, setHealth] = useState<HealthPayload | null>(null);
 
@@ -271,16 +587,6 @@ function Dashboard() {
     (async () => {
       try {
         setHealth(await api.health());
-      } catch {
-        setHealth({});
-      }
-    })();
-  }, []);
-
-  useEffect(() => {
-    (async () => {
-      setStatsLoading(true);
-      try {
         setStats(await api.analytics());
       } finally {
         setStatsLoading(false);
@@ -289,58 +595,123 @@ function Dashboard() {
   }, []);
 
   return (
-    <div className="page p-8 max-w-7xl mx-auto">
-      <div className="flex flex-col gap-4 sm:flex-row sm:justify-between sm:items-start mb-8">
-        <div>
-          <h1 className="text-3xl font-bold tracking-tight mb-2">Dashboard</h1>
-          <p className="text-gray-400 text-sm max-w-xl">Call performance and live voice tests. Metrics use your workspace data from Supabase.</p>
-        </div>
-        <IntegrationPills health={health} />
-      </div>
-      <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-8">
-        {statsLoading ? (
-          <>
-            <StatCardSkeleton />
-            <StatCardSkeleton />
-            <StatCardSkeleton />
-            <StatCardSkeleton />
-          </>
-        ) : (
+    <AppPage title="Dashboard" subtitle="Call performance and launch readiness for your voice agents.">
+      <IntegrationPills health={health} />
+      <div className="mt-6 grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
+        {statsLoading ? Array.from({ length: 4 }).map((_, index) => <StatCardSkeleton key={index} />) : (
           <>
             <StatCard label="Total Calls" value={stats?.total_calls} />
-            <StatCard label="Bookings" value={stats?.total_bookings} />
+            <StatCard label="Answered" value={stats?.answered_calls} />
+            <StatCard label="Failed" value={stats?.failed_calls} />
+            <StatCard label="Total Minutes" value={stats?.total_minutes} />
             <StatCard label="Avg Duration (s)" value={stats?.avg_duration} />
+            <StatCard label="AI Cost ($)" value={stats?.estimated_ai_cost} />
+            <StatCard label="Bookings" value={stats?.total_bookings} />
             <StatCard label="Booking Rate (%)" value={stats?.booking_rate} />
           </>
         )}
       </div>
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
-        <VoiceTester />
-        <div className="card bg-gray-800/80 p-8 rounded-2xl border border-gray-700 min-h-64 flex flex-col items-center justify-center text-center ring-1 ring-white/5">
-          {statsLoading ? (
-            <div className="w-full space-y-3 animate-pulse">
-              <div className="h-4 w-3/4 max-w-xs mx-auto rounded bg-gray-700" />
-              <div className="h-24 w-full max-w-sm mx-auto rounded-xl bg-gray-700/50" />
-            </div>
-          ) : (stats?.total_calls ?? 0) === 0 ? (
-            <>
-              <p className="text-gray-300 font-medium mb-1">No call volume yet</p>
-              <p className="text-gray-500 text-sm max-w-sm">Run a demo or outbound call. Trends and charts can plug in here once you have history.</p>
-            </>
-          ) : (
-            <p className="text-gray-500 text-sm">Analytics charts can be added here (e.g. daily calls, booking funnel).</p>
-          )}
+      <div className="mt-6 grid gap-5 xl:grid-cols-2">
+        <CallNowCard />
+        <OnboardingChecklist health={health} />
+        <div className="rounded-lg border border-slate-200 bg-white p-6">
+          <VoiceTester />
         </div>
       </div>
+    </AppPage>
+  );
+}
+
+function CallNowCard() {
+  const [phoneNumber, setPhoneNumber] = useState('');
+  const [status, setStatus] = useState('');
+  const [error, setError] = useState('');
+  const [loading, setLoading] = useState(false);
+
+  const startCall = async () => {
+    setStatus('');
+    setError('');
+    setLoading(true);
+    try {
+      const result = await api.callNow(phoneNumber);
+      setStatus(`Dispatched ${result.phone_number} in ${result.room_name}`);
+    } catch (err: any) {
+      setError(err?.message || 'Call failed to dispatch.');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <div className="rounded-lg border border-slate-200 bg-white p-6 shadow-sm">
+      <div className="mb-5 flex h-12 w-12 items-center justify-center rounded-md bg-blue-50 text-blue-600">
+        <PhoneCall size={26} weight="fill" />
+      </div>
+      <h2 className="text-xl font-bold text-slate-950">Call Now</h2>
+      <p className="mt-2 text-sm text-slate-500">Trigger a real outbound LiveKit SIP call through the Railway backend.</p>
+      <label className="mt-5 block">
+        <span className="text-sm font-medium text-slate-600">Phone number</span>
+        <input
+          value={phoneNumber}
+          onChange={(event) => setPhoneNumber(event.target.value)}
+          placeholder="+919876543210"
+          className="mt-2 w-full rounded-md border border-slate-200 px-4 py-3 text-slate-950 outline-none focus:border-blue-400"
+        />
+      </label>
+      <ShellButton primary onClick={startCall} className="mt-5 w-full" >
+        {loading ? 'Dispatching...' : 'Call Now'}
+      </ShellButton>
+      {status && <p className="mt-4 text-sm text-emerald-600">{status}</p>}
+      {error && <p className="mt-4 text-sm text-red-600">{error}</p>}
     </div>
   );
 }
 
 function StatCard({ label, value }: { label: string; value: number | undefined }) {
   return (
-    <div className="card bg-gray-800/80 p-4 rounded-xl border border-gray-700 ring-1 ring-white/5">
-      <p className="text-gray-400 text-sm">{label}</p>
-      <p className="text-2xl font-bold tabular-nums">{value ?? '—'}</p>
+    <div className="rounded-lg border border-slate-200 bg-white p-4 shadow-sm">
+      <p className="text-sm text-slate-500">{label}</p>
+      <p className="mt-2 text-3xl font-black tabular-nums text-slate-950">{value ?? '-'}</p>
+    </div>
+  );
+}
+
+function StatCardSkeleton() {
+  return (
+    <div className="animate-pulse rounded-lg border border-slate-200 bg-white p-4">
+      <div className="h-3 w-24 rounded bg-slate-200" />
+      <div className="mt-4 h-8 w-16 rounded bg-slate-200" />
+    </div>
+  );
+}
+
+function OnboardingChecklist({ health }: { health: HealthPayload | null }) {
+  const items = [
+    ['Create account', true],
+    ['Connect Supabase', Boolean(health?.supabase_configured)],
+    ['Add service role key', Boolean(health?.service_role_key_present)],
+    ['Connect LiveKit', Boolean(health?.livekit_configured)],
+  ] as const;
+
+  return (
+    <div className="rounded-lg border border-slate-200 bg-white p-6 shadow-sm">
+      <div className="mb-4 flex items-center justify-between gap-4">
+        <div>
+          <h2 className="text-lg font-bold text-slate-950">Launch checklist</h2>
+          <p className="text-sm text-slate-500">Everything needed before customers use calls.</p>
+        </div>
+        <ShieldCheck size={24} weight="duotone" className="text-blue-600" />
+      </div>
+      <div className="space-y-3">
+        {items.map(([label, done]) => (
+          <div key={label} className="flex items-center justify-between rounded-md bg-slate-50 px-3 py-2">
+            <span className="text-sm text-slate-700">{label}</span>
+            <span className={`text-xs font-semibold ${done ? 'text-emerald-600' : 'text-amber-600'}`}>
+              {done ? 'Ready' : 'Needs setup'}
+            </span>
+          </div>
+        ))}
+      </div>
     </div>
   );
 }
@@ -348,50 +719,46 @@ function StatCard({ label, value }: { label: string; value: number | undefined }
 function CallLogs() {
   const [rows, setRows] = useState<any[]>([]);
   useEffect(() => {
-    (async () => {
-      setRows(await api.calls());
-    })();
+    (async () => setRows(await api.calls()))();
   }, []);
 
   return (
-    <div className="page p-8">
-      <h1 className="text-2xl font-bold mb-4">Call Logs</h1>
-      <div className="space-y-3">
-        {rows.slice(0, 30).map((r, i) => (
-          <div key={i} className="bg-gray-800 border border-gray-700 rounded-xl p-4">
-            <div className="text-xs text-gray-400">{r.created_at || '-'}</div>
-            <div className="font-semibold">{r.phone || 'unknown'}</div>
-            <div className="text-sm text-gray-300">{r.summary || 'No summary'}</div>
+    <AppPage title="Call History" subtitle="Review recent customer conversations and call summaries.">
+      <DataList
+        rows={rows.slice(0, 30)}
+        emptyText="No call logs yet."
+        render={(row, index) => (
+          <div key={row.id || index} className="rounded-lg border border-slate-200 bg-white p-4 shadow-sm">
+            <div className="text-xs text-slate-500">{row.created_at || '-'}</div>
+            <div className="mt-1 font-semibold text-slate-950">{row.phone || 'unknown'}</div>
+            <div className="mt-1 text-sm text-slate-600">{row.summary || 'No summary'}</div>
           </div>
-        ))}
-        {!rows.length && <p className="text-gray-400">No call logs yet.</p>}
-      </div>
-    </div>
+        )}
+      />
+    </AppPage>
   );
 }
 
 function Crm() {
   const [rows, setRows] = useState<any[]>([]);
   useEffect(() => {
-    (async () => {
-      setRows(await api.contacts());
-    })();
+    (async () => setRows(await api.contacts()))();
   }, []);
 
   return (
-    <div className="page p-8">
-      <h1 className="text-2xl font-bold mb-4">CRM Contacts</h1>
-      <div className="space-y-3">
-        {rows.slice(0, 50).map((r, i) => (
-          <div key={i} className="bg-gray-800 border border-gray-700 rounded-xl p-4">
-            <div className="font-semibold">{r.caller_name || 'Unknown'}</div>
-            <div className="text-sm text-gray-300">{r.phone || 'unknown'}</div>
-            <div className="text-xs text-gray-400">Calls: {r.total_calls || 0}</div>
+    <AppPage title="CRM Contacts" subtitle="Contacts discovered from call activity.">
+      <DataList
+        rows={rows.slice(0, 50)}
+        emptyText="No contacts yet."
+        render={(row, index) => (
+          <div key={row.phone || index} className="rounded-lg border border-slate-200 bg-white p-4 shadow-sm">
+            <div className="font-semibold text-slate-950">{row.caller_name || 'Unknown'}</div>
+            <div className="text-sm text-slate-600">{row.phone || 'unknown'}</div>
+            <div className="text-xs text-slate-500">Calls: {row.total_calls || 0}</div>
           </div>
-        ))}
-        {!rows.length && <p className="text-gray-400">No contacts yet.</p>}
-      </div>
-    </div>
+        )}
+      />
+    </AppPage>
   );
 }
 
@@ -400,9 +767,7 @@ function Settings() {
   const [message, setMessage] = useState('');
 
   useEffect(() => {
-    (async () => {
-      setConfig(await api.config());
-    })();
+    (async () => setConfig(await api.config()))();
   }, []);
 
   const onSave = async () => {
@@ -416,107 +781,195 @@ function Settings() {
   };
 
   return (
-    <div className="page p-8">
-      <h1 className="text-2xl font-bold mb-4">Agent Settings</h1>
-      <div className="max-w-2xl bg-gray-800 border border-gray-700 rounded-xl p-6 space-y-4">
-        <label className="block">
-          <span className="text-sm text-gray-400">First Line</span>
-          <input
-            className="mt-1 w-full rounded-lg bg-gray-900 border border-gray-700 px-3 py-2"
-            value={config.first_line || ''}
-            onChange={(e) => setConfig({ ...config, first_line: e.target.value })}
-          />
-        </label>
-        <label className="block">
-          <span className="text-sm text-gray-400">LLM Model</span>
-          <input
-            className="mt-1 w-full rounded-lg bg-gray-900 border border-gray-700 px-3 py-2"
-            value={config.llm_model || ''}
-            onChange={(e) => setConfig({ ...config, llm_model: e.target.value })}
-          />
-        </label>
-        <button onClick={onSave} className="bg-indigo-600 hover:bg-indigo-500 px-4 py-2 rounded-lg">
-          Save Settings
-        </button>
-        {message && <p className="text-sm text-gray-300">{message}</p>}
+    <AppPage title="Agent Settings" subtitle="Tune default behavior and model configuration.">
+      <div className="max-w-3xl rounded-lg border border-slate-200 bg-white p-6 shadow-sm">
+        <SettingField label="First Line" value={config.first_line || ''} />
+        <div className="mt-4" />
+        <SettingField label="LLM Model" value={config.llm_model || ''} />
+        <ShellButton primary onClick={onSave} className="mt-5"><FloppyDisk size={18} /> Save Settings</ShellButton>
+        {message && <p className="mt-3 text-sm text-slate-600">{message}</p>}
       </div>
-    </div>
+    </AppPage>
   );
 }
 
-function ResourceList({ title, loader, emptyText }: { title: string; loader: () => Promise<any[]>; emptyText: string }) {
-  const [rows, setRows] = useState<any[]>([]);
+function ResourceList({ title, emptyText, icon: Icon }: { title: string; emptyText: string; icon: any }) {
+  return (
+    <AppPage title={title} subtitle="This module is ready for the next production workflow.">
+      <div className="rounded-lg border border-dashed border-slate-300 bg-white p-10 text-center shadow-sm">
+        <Icon size={34} className="mx-auto mb-4 text-blue-600" />
+        <p className="font-semibold text-slate-950">{emptyText}</p>
+        <p className="mt-2 text-sm text-slate-500">The navigation and SaaS surface are in place; backend persistence can be added per module.</p>
+      </div>
+    </AppPage>
+  );
+}
+
+function Campaigns() {
+  const [rows, setRows] = useState<Campaign[]>([]);
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
     (async () => {
       try {
-        setRows(await loader());
+        setRows(await api.campaigns());
       } finally {
         setLoading(false);
       }
     })();
-  }, [loader]);
+  }, []);
 
   return (
-    <div className="page p-8">
-      <h1 className="text-2xl font-bold mb-4">{title}</h1>
-      {loading ? (
-        <p className="text-gray-400">Loading...</p>
-      ) : rows.length ? (
-        <div className="space-y-3">
-          {rows.slice(0, 50).map((row, index) => (
-            <pre key={row.id || index} className="overflow-auto rounded-xl border border-gray-700 bg-gray-800 p-4 text-xs text-gray-200">
-              {JSON.stringify(row, null, 2)}
-            </pre>
+    <AppPage title="Campaigns" subtitle="Outbound batches and their progress.">
+      <div className="mb-5 flex justify-end"><ShellButton><Plus size={18} /> New campaign</ShellButton></div>
+      {loading ? <p className="text-slate-500">Loading...</p> : rows.length ? (
+        <div className="grid gap-4 lg:grid-cols-2">
+          {rows.map((row, index) => (
+            <div key={row.id || index} className="rounded-lg border border-slate-200 bg-white p-5 shadow-sm">
+              <div className="mb-4 flex items-start justify-between gap-4">
+                <div>
+                  <h2 className="font-bold text-slate-950">{row.name || 'Untitled campaign'}</h2>
+                  <p className="text-xs text-slate-500">{row.created_at || 'No date'}</p>
+                </div>
+                <span className="rounded-full border border-blue-100 bg-blue-50 px-3 py-1 text-xs font-semibold text-blue-700">{row.status || 'draft'}</span>
+              </div>
+              <div className="grid grid-cols-2 gap-3 text-sm">
+                <StatCard label="Total calls" value={row.total_calls ?? 0} />
+                <StatCard label="Completed" value={row.completed_calls ?? 0} />
+              </div>
+            </div>
           ))}
         </div>
       ) : (
-        <p className="text-gray-400">{emptyText}</p>
+        <div className="rounded-lg border border-dashed border-slate-300 bg-white p-10 text-center shadow-sm">
+          <p className="font-semibold text-slate-950">No campaigns yet</p>
+          <p className="mt-2 text-sm text-slate-500">Single calls are ready now. Campaign creation is the next production workflow.</p>
+        </div>
       )}
-    </div>
+    </AppPage>
   );
 }
 
-function Agents() {
-  return <ResourceList title="Agents" loader={api.agents} emptyText="No agents returned by /api/agents yet." />;
+function Billing() {
+  const [billing, setBilling] = useState<BillingSummary | null>(null);
+
+  useEffect(() => {
+    (async () => setBilling(await api.billing()))();
+  }, []);
+
+  return (
+    <AppPage title="Billing" subtitle="Usage and trial billing summary.">
+      <div className="grid gap-4 md:grid-cols-3">
+        <StatCard label="Plan" value={undefined} />
+        <div className="rounded-lg border border-slate-200 bg-white p-4 shadow-sm">
+          <p className="text-sm text-slate-500">Current plan</p>
+          <p className="mt-2 text-3xl font-black text-slate-950">{billing?.plan || 'Launch'}</p>
+          <p className="mt-1 text-sm text-blue-600">{billing?.status || 'trial'}</p>
+        </div>
+        <StatCard label="Included minutes" value={billing?.included_minutes} />
+        <div className="rounded-lg border border-slate-200 bg-white p-4 shadow-sm">
+          <p className="text-sm text-slate-500">Next invoice estimate</p>
+          <p className="mt-2 text-3xl font-black text-slate-950">${billing?.next_invoice_estimate ?? 0}</p>
+          <p className="mt-1 text-sm text-slate-500">Used: {billing?.used_minutes ?? 0} min</p>
+        </div>
+      </div>
+    </AppPage>
+  );
 }
 
-function Campaigns() {
-  return <ResourceList title="Campaigns" loader={api.campaigns} emptyText="No campaigns returned by /api/campaigns yet." />;
-}
-
-function Analytics() {
-  const [stats, setStats] = useState<{ total_calls: number; total_bookings: number; avg_duration: number; booking_rate: number } | null>(null);
+function Admin() {
+  const [me, setMe] = useState<CurrentUser | null>(null);
+  const [workspace, setWorkspace] = useState<WorkspaceSummary | null>(null);
 
   useEffect(() => {
     (async () => {
-      setStats(await api.analytics());
+      const [user, workspaceSummary] = await Promise.all([api.me(), api.workspace()]);
+      setMe(user);
+      setWorkspace(workspaceSummary);
     })();
   }, []);
 
   return (
-    <div className="page p-8">
-      <h1 className="text-2xl font-bold mb-4">Analytics</h1>
-      <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
-        <StatCard label="Total Calls" value={stats?.total_calls} />
-        <StatCard label="Bookings" value={stats?.total_bookings} />
-        <StatCard label="Avg Duration (s)" value={stats?.avg_duration} />
-        <StatCard label="Booking Rate (%)" value={stats?.booking_rate} />
+    <AppPage title="Workplace" subtitle="Workspace, role, and deployment readiness.">
+      <div className="grid gap-4 lg:grid-cols-2">
+        <InfoCard title="Workspace" rows={[
+          ['Name', workspace?.name || 'Personal'],
+          ['Role', workspace?.role || me?.role || 'member'],
+          ['Members', String(workspace?.member_count ?? 1)],
+          ['Workspace ID', workspace?.id || 'created after first authenticated request'],
+        ]} />
+        <InfoCard title="Current user" rows={[
+          ['Email', me?.email || 'Loading...'],
+          ['User ID', me?.user_id || 'Loading...'],
+          ['App role', me?.role || 'user'],
+        ]} />
       </div>
+    </AppPage>
+  );
+}
+
+function Analytics() {
+  const [stats, setStats] = useState<AnalyticsSummary | null>(null);
+
+  useEffect(() => {
+    (async () => setStats(await api.analytics()))();
+  }, []);
+
+  return (
+    <AppPage title="Analytics" subtitle="Performance metrics for your voice operation.">
+      <div className="grid grid-cols-2 gap-4 lg:grid-cols-4">
+        <StatCard label="Total Calls" value={stats?.total_calls} />
+        <StatCard label="Answered Calls" value={stats?.answered_calls} />
+        <StatCard label="Failed Calls" value={stats?.failed_calls} />
+        <StatCard label="Avg Duration (s)" value={stats?.avg_duration} />
+        <StatCard label="Total Minutes" value={stats?.total_minutes} />
+        <StatCard label="Estimated AI Cost ($)" value={stats?.estimated_ai_cost} />
+        <StatCard label="Bookings" value={stats?.total_bookings} />
+      </div>
+    </AppPage>
+  );
+}
+
+function InfoCard({ title, rows }: { title: string; rows: string[][] }) {
+  return (
+    <div className="rounded-lg border border-slate-200 bg-white p-6 shadow-sm">
+      <h2 className="mb-4 text-lg font-bold text-slate-950">{title}</h2>
+      <div className="space-y-3 text-sm">
+        {rows.map(([label, value]) => (
+          <p key={label} className="break-words text-slate-700"><span className="font-medium text-slate-500">{label}:</span> {value}</p>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function DataList({ rows, render, emptyText }: { rows: any[]; render: (row: any, index: number) => React.ReactNode; emptyText: string }) {
+  return rows.length ? <div className="space-y-3">{rows.map(render)}</div> : <p className="text-slate-500">{emptyText}</p>;
+}
+
+function AppPage({ title, subtitle, children }: { title: string; subtitle: string; children: React.ReactNode }) {
+  return (
+    <div className="min-h-full bg-slate-50 p-8 text-slate-950">
+      <div className="mb-6">
+        <h1 className="text-3xl font-black tracking-tight">{title}</h1>
+        <p className="mt-2 text-sm text-slate-500">{subtitle}</p>
+      </div>
+      {children}
     </div>
   );
 }
 
 function SidebarLink({ to, icon: Icon, children }: { to: string, icon: any, children: React.ReactNode }) {
   const location = useLocation();
-  const isActive = location.pathname === to;
+  const isActive = location.pathname === to || (to === '/agents' && location.pathname === '/');
   return (
-    <Link 
-      to={to} 
-      className={`nav-item flex items-center gap-3 px-6 py-3 transition-colors ${isActive ? 'bg-indigo-600/10 text-indigo-400 border-r-2 border-indigo-400' : 'hover:bg-gray-700 hover:text-white text-gray-400'}`}
+    <Link
+      to={to}
+      className={`flex min-h-10 items-center gap-3 rounded-md px-4 text-sm font-semibold transition ${
+        isActive ? 'bg-slate-100 text-slate-950' : 'text-slate-700 hover:bg-slate-50 hover:text-slate-950'
+      }`}
     >
-      <Icon size={20} weight={isActive ? "fill" : "regular"} /> {children}
+      <Icon size={21} weight={isActive ? 'fill' : 'regular'} className="text-slate-600" /> {children}
     </Link>
   );
 }
@@ -524,36 +977,65 @@ function SidebarLink({ to, icon: Icon, children }: { to: string, icon: any, chil
 function Layout({ children }: { children: React.ReactNode }) {
   const navigate = useNavigate();
   return (
-    <div className="layout flex h-screen bg-gray-900 text-gray-100">
-      <nav className="sidebar w-64 bg-[#161b22] border-r border-gray-800 flex flex-col shrink-0">
-        <div className="p-6 border-b border-gray-800">
-          <h2 className="text-xl font-bold bg-gradient-to-r from-indigo-400 to-cyan-400 bg-clip-text text-transparent">RapidX Voice OS</h2>
-          <p className="text-xs text-gray-500 mt-1 font-mono">build: antigravity-dev</p>
+    <div className="flex h-screen min-w-[1180px] bg-slate-50 text-slate-950">
+      <nav className="flex w-[210px] shrink-0 flex-col border-r border-slate-200 bg-white">
+        <div className="border-b border-slate-200 p-5">
+          <div className="flex items-center justify-between gap-3">
+            <div className="flex items-center gap-3">
+              <div className="flex h-9 w-9 items-center justify-center rounded-md border border-slate-200 bg-slate-50 font-bold">J</div>
+              <div>
+                <h2 className="font-bold leading-tight">Jettone</h2>
+                <p className="text-sm text-blue-600">Active</p>
+              </div>
+            </div>
+            <CaretUpDown size={18} className="text-slate-500" />
+          </div>
         </div>
-        <div className="flex-1 py-4 flex flex-col gap-1">
-          <SidebarLink to="/dashboard" icon={ChartLineUp}>Dashboard</SidebarLink>
-          <SidebarLink to="/agents" icon={Users}>Agents</SidebarLink>
-          <SidebarLink to="/terminal" icon={TerminalWindow}>Terminal Logs</SidebarLink>
-          <SidebarLink to="/logs" icon={PhoneCall}>Calls</SidebarLink>
-          <SidebarLink to="/campaigns" icon={PlayCircle}>Campaigns</SidebarLink>
-          <SidebarLink to="/analytics" icon={ChartLineUp}>Analytics</SidebarLink>
-          <SidebarLink to="/crm" icon={Users}>CRM Contacts</SidebarLink>
-          <SidebarLink to="/settings" icon={Gear}>Settings</SidebarLink>
+        <div className="flex-1 overflow-y-auto p-3">
+          <p className="mb-2 px-2 text-xs font-semibold text-slate-400">Platform</p>
+          <div className="space-y-1">
+            <SidebarLink to="/agents" icon={ListBullets}>Agent Setup</SidebarLink>
+            <SidebarLink to="/logs" icon={ListBullets}>Call History</SidebarLink>
+            <SidebarLink to="/numbers" icon={Hash}>My Numbers</SidebarLink>
+            <SidebarLink to="/sip-trunks" icon={PhoneCall}>SIP Trunks</SidebarLink>
+            <SidebarLink to="/knowledge-base" icon={Database}>Knowledge Base</SidebarLink>
+            <SidebarLink to="/batches" icon={Stack}>Batches</SidebarLink>
+            <SidebarLink to="/developers" icon={Code}>Developers</SidebarLink>
+            <SidebarLink to="/providers" icon={PlugsConnected}>Providers</SidebarLink>
+            <SidebarLink to="/workflows" icon={GitBranch}>Workflows</SidebarLink>
+            <SidebarLink to="/campaigns" icon={ChartLineUp}>Campaigns</SidebarLink>
+            <SidebarLink to="/documentation" icon={BookOpen}>Documentation</SidebarLink>
+          </div>
+          <p className="mb-2 mt-8 px-2 text-xs font-semibold text-slate-400">Team</p>
+          <div className="space-y-1">
+            <SidebarLink to="/admin" icon={Gear}>Workplace</SidebarLink>
+            <SidebarLink to="/dashboard" icon={ChartLineUp}>Dashboard</SidebarLink>
+            <SidebarLink to="/analytics" icon={ChartLineUp}>Analytics</SidebarLink>
+            <SidebarLink to="/crm" icon={Users}>CRM Contacts</SidebarLink>
+            <SidebarLink to="/billing" icon={CreditCard}>Billing</SidebarLink>
+            <SidebarLink to="/settings" icon={ShieldCheck}>Settings</SidebarLink>
+            <SidebarLink to="/terminal" icon={TerminalWindow}>Terminal Logs</SidebarLink>
+          </div>
         </div>
-        <div className="p-4 border-t border-gray-800 text-xs text-gray-500 text-center font-mono">
+        <div className="border-t border-slate-200 p-3">
           <button
-            onClick={() => {
-              clearAccessToken();
+            onClick={async () => {
+              await clearAccessToken();
               navigate('/login');
             }}
-            className="mb-2 text-gray-300 hover:text-white"
+            className="flex w-full items-center justify-between rounded-md bg-slate-50 px-3 py-3 text-sm font-semibold text-slate-900 hover:bg-slate-100"
           >
-            Logout
+            <span className="flex items-center gap-2"><span className="flex h-7 w-7 items-center justify-center rounded-full bg-white text-xs shadow-sm">R</span> raghu@maxr.io</span>
+            <CaretUpDown size={16} />
           </button>
-          <div>Powered by LiveKit & FastAPI</div>
         </div>
       </nav>
-      <main className="flex-1 overflow-y-auto">
+      <main className="flex-1 overflow-auto">
+        {!isApiConfigured && (
+          <div className="border-b border-amber-200 bg-amber-50 px-6 py-3 text-sm font-medium text-amber-900">
+            {apiConnectionMessage}
+          </div>
+        )}
         {children}
       </main>
     </div>
@@ -569,6 +1051,11 @@ function ProtectedRoute({ children }: { children: React.ReactNode }) {
       setAuthenticated(Boolean(await getAccessToken()));
       setLoading(false);
     })();
+    const { data } = supabase.auth.onAuthStateChange((_event, session) => {
+      setAuthenticated(Boolean(session?.access_token));
+      setLoading(false);
+    });
+    return () => data.subscription.unsubscribe();
   }, []);
 
   if (loading) {
@@ -597,11 +1084,21 @@ function App() {
                   <Route path="/agents" element={<Agents />} />
                   <Route path="/terminal" element={<TerminalPage />} />
                   <Route path="/logs" element={<CallLogs />} />
+                  <Route path="/numbers" element={<ResourceList title="My Numbers" icon={Hash} emptyText="No phone numbers connected yet." />} />
+                  <Route path="/sip-trunks" element={<ResourceList title="SIP Trunks" icon={PhoneCall} emptyText="No SIP trunks connected yet." />} />
+                  <Route path="/knowledge-base" element={<ResourceList title="Knowledge Base" icon={Database} emptyText="No knowledge base sources uploaded yet." />} />
+                  <Route path="/batches" element={<ResourceList title="Batches" icon={Stack} emptyText="No batches created yet." />} />
+                  <Route path="/developers" element={<ResourceList title="Developers" icon={Code} emptyText="No developer keys or webhooks configured yet." />} />
+                  <Route path="/providers" element={<ResourceList title="Providers" icon={PlugsConnected} emptyText="No voice or telephony providers configured yet." />} />
+                  <Route path="/workflows" element={<ResourceList title="Workflows" icon={GitBranch} emptyText="No workflows created yet." />} />
                   <Route path="/campaigns" element={<Campaigns />} />
+                  <Route path="/documentation" element={<ResourceList title="Documentation" icon={BookOpen} emptyText="No documentation pages connected yet." />} />
                   <Route path="/analytics" element={<Analytics />} />
                   <Route path="/crm" element={<Crm />} />
+                  <Route path="/billing" element={<Billing />} />
                   <Route path="/settings" element={<Settings />} />
-                  <Route path="*" element={<Navigate to="/dashboard" replace />} />
+                  <Route path="/admin" element={<Admin />} />
+                  <Route path="*" element={<Navigate to="/agents" replace />} />
                 </Routes>
               </Layout>
             </ProtectedRoute>

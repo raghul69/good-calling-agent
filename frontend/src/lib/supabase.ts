@@ -1,9 +1,7 @@
 import { createClient } from "@supabase/supabase-js";
 
-// createClient("", "") throws at import time (blank page). Use placeholders when env is missing.
-const PLACEHOLDER_URL = "https://placeholder.supabase.co";
-const PLACEHOLDER_ANON_KEY =
-  "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InBsYWNlaG9sZGVyIiwicm9sZSI6ImFub24iLCJpYXQiOjE2NDUxOTI4MDAsImV4cCI6MTk2MDc2ODgwMH0.build-placeholder";
+const FALLBACK_SUPABASE_URL = "https://example.supabase.co";
+const FALLBACK_SUPABASE_ANON_KEY = "missing-anon-key";
 
 const urlRaw = (
   import.meta.env.NEXT_PUBLIC_SUPABASE_URL ||
@@ -18,17 +16,14 @@ const keyRaw = (
 
 export const isSupabaseConfigured = Boolean(urlRaw && keyRaw);
 
-const supabaseUrl = urlRaw || PLACEHOLDER_URL;
-const supabaseAnonKey = keyRaw || PLACEHOLDER_ANON_KEY;
-
-export const supabase = createClient(supabaseUrl, supabaseAnonKey, {
+export const supabase = createClient(urlRaw || FALLBACK_SUPABASE_URL, keyRaw || FALLBACK_SUPABASE_ANON_KEY, {
   auth: {
-    persistSession: isSupabaseConfigured,
-    autoRefreshToken: isSupabaseConfigured,
-    detectSessionInUrl: isSupabaseConfigured,
+    persistSession: true,
+    autoRefreshToken: true,
+    detectSessionInUrl: true,
   },
 });
 
-export function getAuthRedirectUrl(path = "/dashboard") {
+export function getAuthRedirectUrl(path = "/agents") {
   return `${window.location.origin}${path}`;
 }

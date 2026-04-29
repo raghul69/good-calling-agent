@@ -96,7 +96,8 @@ def get_live_config(phone_number: str | None = None):
         "stt_provider":             config.get("stt_provider", "sarvam"),
         "stt_language":             config.get("stt_language", "unknown"),
         "lang_preset":              config.get("lang_preset", "multilingual"),
-        "max_turns":                config.get("max_turns", 25),
+        "max_turns":                config.get("max_turns", 14),
+        "silence_timeout_seconds":  config.get("silence_timeout_seconds", 45),
         **config,
     }
 
@@ -300,7 +301,13 @@ class OutboundAssistant(Agent):
         ist_context       = get_ist_time_context()
         lang_preset       = live_config_loaded.get("lang_preset", "multilingual")
         lang_instruction  = get_language_instruction(lang_preset)
-        final_instructions = base_instructions + ist_context + lang_instruction
+        cost_guardrail = (
+            "\n\n[VOICE STYLE]\n"
+            "Speak in one short sentence when possible, never more than two. "
+            "Keep responses under 20 words unless confirming critical details. "
+            "Ask one question at a time and avoid unnecessary TTS output."
+        )
+        final_instructions = base_instructions + ist_context + lang_instruction + cost_guardrail
 
         # Token counter (#11)
         token_count = count_tokens(final_instructions)
@@ -314,8 +321,7 @@ class OutboundAssistant(Agent):
         greeting = self._live_config.get(
             "first_line",
             self._first_line or (
-                "Namaste! This is Aryan from RapidX AI — we help businesses automate with AI. "
-                "Hmm, may I ask what kind of business you run?"
+                "Namaste! This is Jettone calling. How can I help you today?"
             )
         )
         await self.session.generate_reply(
@@ -342,17 +348,26 @@ async def entrypoint(ctx: JobContext):
     caller_phone = "unknown"
     owner_user_id = None
     owner_workspace_id = None
+    call_record_id = None
+    retry_count = 0
+    max_retries = int(os.getenv("MAX_CALL_RETRIES", "3") or 3)
 
     # Try metadata first (outbound dispatch)
     metadata = ctx.job.metadata or ""
+    logger.info("[DISPATCH] Raw metadata: %s", metadata or "<empty>")
     if metadata:
         try:
             meta = json.loads(metadata)
-            phone_number = meta.get("phone_number")
+            if not isinstance(meta, dict):
+                raise ValueError("metadata JSON is not an object")
+            phone_number = meta.get("phone_number") or meta.get("to") or meta.get("phone")
             owner_user_id = meta.get("user_id")
             owner_workspace_id = meta.get("workspace_id")
-        except Exception:
-            pass
+            call_record_id = meta.get("db_call_id")
+            retry_count = int(meta.get("retry_count") or 0)
+            max_retries = int(meta.get("max_retries") or max_retries)
+        except Exception as e:
+            logger.warning("[DISPATCH] Failed to parse metadata: %s", e)
 
     # Extract from SIP participants
     for identity, participant in ctx.room.remote_participants.items():
@@ -386,7 +401,8 @@ async def entrypoint(ctx: JobContext):
     tts_provider  = live_config.get("tts_provider", "sarvam")
     stt_provider  = live_config.get("stt_provider", "sarvam")
     stt_language  = live_config.get("stt_language", "unknown")  # auto-detect (#20)
-    max_turns     = live_config.get("max_turns", 25)
+    max_turns     = live_config.get("max_turns", 14)
+    silence_timeout_seconds = int(live_config.get("silence_timeout_seconds", 45) or 45)
 
     # Override OS env vars from UI config
     for key in ["LIVEKIT_URL","LIVEKIT_API_KEY","LIVEKIT_API_SECRET","OPENAI_API_KEY",
@@ -436,11 +452,55 @@ async def entrypoint(ctx: JobContext):
     agent_tools.ctx_api   = ctx.api
     agent_tools.room_name = ctx.room.name
 
+    # ── Outbound SIP dial ────────────────────────────────────────────────
+    if phone_number and caller_phone not in ("unknown", "demo"):
+        outbound_trunk_id = os.getenv("OUTBOUND_TRUNK_ID", "").strip()
+        if not outbound_trunk_id:
+            logger.error("[SIP] OUTBOUND_TRUNK_ID is missing; cannot dial %s", caller_phone)
+            if call_record_id:
+                import backend.db as db
+                db.mark_call_failed(call_record_id, "sip_failure", retry_count=retry_count, max_retries=max_retries)
+            return
+        else:
+            logger.info("[SIP] Dialing %s in room %s using trunk %s", caller_phone, ctx.room.name, outbound_trunk_id)
+            try:
+                await ctx.api.sip.create_sip_participant(
+                    api.CreateSIPParticipantRequest(
+                        sip_trunk_id=outbound_trunk_id,
+                        sip_call_to=caller_phone,
+                        room_name=ctx.room.name,
+                        participant_identity=agent_tools._sip_identity,
+                        participant_name=caller_name or caller_phone,
+                        wait_until_answered=True,
+                    )
+                )
+                logger.info("[SIP] Participant connected: %s", agent_tools._sip_identity)
+                if call_record_id:
+                    import backend.db as db
+                    db.mark_call_answered(call_record_id, room_name=ctx.room.name)
+            except Exception as e:
+                logger.exception("[SIP] create_sip_participant failed for %s: %s", caller_phone, e)
+                failure_text = str(e).lower()
+                if "busy" in failure_text:
+                    reason = "busy"
+                elif "timeout" in failure_text or "timed out" in failure_text:
+                    reason = "timeout"
+                elif "no answer" in failure_text or "no_answer" in failure_text:
+                    reason = "no_answer"
+                else:
+                    reason = "sip_failure"
+                if call_record_id:
+                    import backend.db as db
+                    db.mark_call_failed(call_record_id, reason, retry_count=retry_count, max_retries=max_retries)
+                return
+    else:
+        logger.info("[SIP] No outbound phone number found; running without SIP dial.")
+
     # ── Build LLM (#8 Groq support) ───────────────────────────────────────
     if llm_provider == "groq":
         agent_llm = openai.LLM.with_groq(
             model=llm_model or "llama-3.3-70b-versatile",
-            max_completion_tokens=120,
+            max_completion_tokens=int(os.getenv("VOICE_MAX_COMPLETION_TOKENS", "64") or 64),
         )
         logger.info(f"[LLM] Using Groq: {llm_model}")
     elif llm_provider == "claude":
@@ -450,11 +510,11 @@ async def entrypoint(ctx: JobContext):
             model=llm_model or "claude-haiku-3-5-latest",
             base_url="https://api.anthropic.com/v1/",
             api_key=_anthropic_key,
-            max_completion_tokens=120,
+            max_completion_tokens=int(os.getenv("VOICE_MAX_COMPLETION_TOKENS", "64") or 64),
         )
         logger.info(f"[LLM] Using Claude via Anthropic: {llm_model}")
     else:
-        agent_llm = openai.LLM(model=llm_model, max_completion_tokens=120)  # cap tokens (#7)
+        agent_llm = openai.LLM(model=llm_model, max_completion_tokens=int(os.getenv("VOICE_MAX_COMPLETION_TOKENS", "64") or 64))  # cap tokens (#7)
         logger.info(f"[LLM] Using OpenAI: {llm_model}")
 
     # ── Build STT (#1 16kHz, #20 auto-detect, #9 Deepgram) ──────────────
@@ -648,6 +708,33 @@ async def entrypoint(ctx: JobContext):
         except Exception as e:
             logger.debug(f"[TRANSCRIPT-STREAM] {e}")
 
+    shutdown_requested = False
+    shutdown_completed = False
+    last_user_activity = time.time()
+
+    async def _inactive_call_watchdog():
+        nonlocal shutdown_requested
+        while not shutdown_requested:
+            await asyncio.sleep(5)
+            if turn_count == 0:
+                continue
+            if time.time() - last_user_activity >= silence_timeout_seconds:
+                logger.info("[INACTIVITY] No caller speech for %ss; ending call.", silence_timeout_seconds)
+                shutdown_requested = True
+                try:
+                    await session.generate_reply(
+                        instructions="Briefly say you are ending the call due to inactivity and thank the caller."
+                    )
+                except Exception:
+                    pass
+                try:
+                    session.shutdown(drain=True)
+                except Exception as e:
+                    logger.warning(f"[INACTIVITY] Session shutdown failed: {e}")
+                return
+
+    asyncio.create_task(_inactive_call_watchdog())
+
     # ── Session event handlers ────────────────────────────────────────────
     @session.on("agent_speech_started")
     def _agent_speech_started(ev):
@@ -674,7 +761,7 @@ async def entrypoint(ctx: JobContext):
 
     @session.on("user_speech_committed")
     def on_user_speech_committed(ev):
-        nonlocal turn_count
+        nonlocal turn_count, last_user_activity
         global agent_is_speaking
 
         transcript = ev.user_transcript.strip()
@@ -690,6 +777,7 @@ async def entrypoint(ctx: JobContext):
             return
 
         # Real-time transcript stream
+        last_user_activity = time.time()
         asyncio.create_task(_log_transcript("user", transcript))
 
         # Turn counter + auto-close (#29)
@@ -702,9 +790,6 @@ async def entrypoint(ctx: JobContext):
                     instructions="Politely wrap up: thank the caller, say they can call back anytime, and say a warm goodbye."
                 )
             )
-
-    shutdown_requested = False
-    shutdown_completed = False
 
     @ctx.room.on("participant_disconnected")
     def on_participant_disconnected(participant):
@@ -891,24 +976,31 @@ async def entrypoint(ctx: JobContext):
         # Save to Supabase
         if not _ensure_time("save_call_log"):
             return
-        from backend.db import save_call_log
-        save_call_log(
-            phone=caller_phone,
-            duration=duration,
-            transcript=transcript_text,
-            summary=booking_status_msg,
-            recording_url=recording_url,
-            caller_name=agent_tools.caller_name or "",
-            sentiment=sentiment,
-            estimated_cost_usd=estimated_cost,
-            call_date=call_dt.date().isoformat(),
-            call_hour=call_dt.hour,
-            call_day_of_week=call_dt.strftime("%A"),
-            was_booked=bool(agent_tools.booking_intent),
-            interrupt_count=interrupt_count,
-            owner_user_id=owner_user_id,
-            workspace_id=owner_workspace_id,
-        )
+        from backend.db import mark_call_completed, save_call_log
+        call_fields = {
+            "phone": caller_phone,
+            "duration": duration,
+            "transcript": transcript_text,
+            "summary": booking_status_msg,
+            "recording_url": recording_url,
+            "caller_name": agent_tools.caller_name or "",
+            "sentiment": sentiment,
+            "estimated_cost_usd": estimated_cost,
+            "call_date": call_dt.date().isoformat(),
+            "call_hour": call_dt.hour,
+            "call_day_of_week": call_dt.strftime("%A"),
+            "was_booked": bool(agent_tools.booking_intent),
+            "interrupt_count": interrupt_count,
+            "owner_user_id": owner_user_id,
+            "workspace_id": owner_workspace_id,
+        }
+        if call_record_id:
+            mark_call_completed(call_record_id, **{
+                k: v for k, v in call_fields.items()
+                if k not in {"owner_user_id", "workspace_id"}
+            })
+        else:
+            save_call_log(**call_fields)
 
     ctx.add_shutdown_callback(unified_shutdown_hook)
 

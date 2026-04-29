@@ -1,5 +1,6 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
+import { apiConnectionMessage, isApiConfigured } from "./lib/api";
 import { getAuthRedirectUrl, isSupabaseConfigured, supabase } from "./lib/supabase";
 
 function getErrorMessage(data: any, fallback: string) {
@@ -20,7 +21,18 @@ export default function Login() {
   const [message, setMessage] = useState("");
   const [messageTone, setMessageTone] = useState<"error" | "success" | "info">("error");
 
+  useEffect(() => {
+    supabase.auth.getSession().then(({ data }) => {
+      if (data.session?.access_token) navigate("/agents", { replace: true });
+    });
+  }, [navigate]);
+
   const submit = async () => {
+    if (!isSupabaseConfigured) {
+      setMessage("Supabase frontend env vars are missing.");
+      setMessageTone("error");
+      return;
+    }
     setLoading(true);
     setMessage("");
     try {
@@ -28,7 +40,7 @@ export default function Login() {
         if (!otpSent) {
           const { error } = await supabase.auth.signInWithOtp({
             email,
-            options: { emailRedirectTo: getAuthRedirectUrl("/dashboard") },
+            options: { emailRedirectTo: getAuthRedirectUrl("/agents") },
           });
           if (error) {
             const apiMessage = error.message || "OTP failed";
@@ -57,7 +69,7 @@ export default function Login() {
           }
           throw new Error(apiMessage);
         }
-        navigate("/dashboard");
+        navigate("/agents");
         return;
       }
 
@@ -65,7 +77,7 @@ export default function Login() {
         const { error } = await supabase.auth.signUp({
           email,
           password,
-          options: { emailRedirectTo: getAuthRedirectUrl("/dashboard") },
+          options: { emailRedirectTo: getAuthRedirectUrl("/agents") },
         });
         if (error) throw new Error(getErrorMessage(error, "Signup failed"));
         setMessage("Signup successful. Check your email to confirm your account.");
@@ -75,7 +87,7 @@ export default function Login() {
 
       const { error } = await supabase.auth.signInWithPassword({ email, password });
       if (error) throw new Error(getErrorMessage(error, "Authentication failed"));
-      navigate("/dashboard");
+      navigate("/agents");
     } catch (e: any) {
       setMessage(e.message || "Authentication failed");
       setMessageTone("error");
@@ -89,15 +101,19 @@ export default function Login() {
       <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(ellipse_80%_50%_at_50%_-20%,rgba(99,102,241,0.22),transparent)]" />
       <div className="relative w-full max-w-md rounded-2xl border border-gray-700/80 bg-gray-900/90 p-8 shadow-2xl shadow-black/40 ring-1 ring-white/5 backdrop-blur-sm">
         <h1 className="text-2xl font-bold tracking-tight bg-gradient-to-r from-indigo-400 to-cyan-400 bg-clip-text text-transparent mb-2">
-          RapidX Voice OS
+          Jettone
         </h1>
         <p className="text-gray-400 text-sm mb-6">
           {mode === "login" ? "Sign in to continue" : mode === "signup" ? "Create your account" : "Login with email OTP"}
         </p>
         {!isSupabaseConfigured && (
-          <p className="text-amber-300 text-sm mb-4 rounded-lg border border-amber-700/60 bg-amber-950/40 px-3 py-2">
-            Auth is not configured: add <code className="text-amber-200">NEXT_PUBLIC_SUPABASE_URL</code> and{" "}
-            <code className="text-amber-200">NEXT_PUBLIC_SUPABASE_ANON_KEY</code> in Vercel, then redeploy.
+          <p className="mb-4 rounded-lg border border-amber-500/40 bg-amber-500/10 px-4 py-3 text-sm text-amber-200">
+            Supabase frontend env vars are missing. Add NEXT_PUBLIC_SUPABASE_URL and NEXT_PUBLIC_SUPABASE_ANON_KEY in Vercel.
+          </p>
+        )}
+        {!isApiConfigured && (
+          <p className="mb-4 rounded-lg border border-amber-500/40 bg-amber-500/10 px-4 py-3 text-sm text-amber-200">
+            {apiConnectionMessage}
           </p>
         )}
         <div className="space-y-4">

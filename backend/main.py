@@ -1,11 +1,16 @@
 import os
 import sys
 import logging
-from fastapi import FastAPI, HTTPException, Depends
+import json
+import re
+import uuid
+import asyncio
+from fastapi import FastAPI, HTTPException, Depends, Request, Header
 from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.exceptions import RequestValidationError
 from urllib.parse import urlparse
 
 # Import routers once we create them
@@ -15,6 +20,43 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("backend-api")
 
 app = FastAPI(title="RapidX AI Dashboard API", version="2.0.0")
+
+
+def _api_error(message: str, code: str = "api_error", request_id: str | None = None) -> dict:
+    return {"error": {"code": code, "message": message, "request_id": request_id}}
+
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    request_id = request.headers.get("x-request-id") or str(uuid.uuid4())
+    logger.warning("HTTP %s %s request_id=%s detail=%s", exc.status_code, request.url.path, request_id, exc.detail)
+    return JSONResponse(
+        status_code=exc.status_code,
+        content=_api_error(str(exc.detail), "http_error", request_id),
+        headers={"x-request-id": request_id},
+    )
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    request_id = request.headers.get("x-request-id") or str(uuid.uuid4())
+    logger.warning("Validation error %s request_id=%s errors=%s", request.url.path, request_id, exc.errors())
+    return JSONResponse(
+        status_code=422,
+        content=_api_error("Invalid request payload", "validation_error", request_id),
+        headers={"x-request-id": request_id},
+    )
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    request_id = request.headers.get("x-request-id") or str(uuid.uuid4())
+    logger.exception("Unhandled API error %s request_id=%s", request.url.path, request_id)
+    return JSONResponse(
+        status_code=500,
+        content=_api_error("Internal server error", "internal_error", request_id),
+        headers={"x-request-id": request_id},
+    )
 
 
 def _cors_origins() -> list[str]:
@@ -33,6 +75,8 @@ def _cors_origins() -> list[str]:
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_cors_origins(),
+    # Allow all Vercel deployments for this project name pattern (main, preview, branch deploys).
+    allow_origin_regex=r"^https://good-calling-agent(?:-[a-z0-9-]+)?\.vercel\.app$",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -76,7 +120,6 @@ if __package__ in (None, ""):
     sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 from backend.config_manager import read_config, write_config
-from fastapi import Request, Header
 
 
 class AuthPayload(BaseModel):
@@ -96,6 +139,24 @@ class EmailOtpVerifyPayload(BaseModel):
     email: str
     token: str
     type: str = "email"
+
+
+class CallPayload(BaseModel):
+    phone_number: str
+    agent_id: str | None = None
+
+
+PHONE_RE = re.compile(r"^\+[1-9]\d{7,15}$")
+
+
+def _validate_phone_number(phone_number: str) -> str:
+    phone = re.sub(r"[\s().-]+", "", (phone_number or "").strip())
+    if not PHONE_RE.match(phone):
+        raise HTTPException(
+            status_code=400,
+            detail="Phone number must be E.164 format, for example +919876543210",
+        )
+    return phone
 
 
 def _apply_config_env() -> None:
@@ -238,6 +299,157 @@ async def api_auth_me(authorization: str = Header(default="")):
         result["workspace_created"] = ws.get("created", False)
     return result
 
+
+@app.get("/api/workspace")
+async def api_workspace(user: dict = Depends(_require_auth)):
+    return db.fetch_workspace_summary(user)
+
+
+async def _dispatch_outbound_call(payload: CallPayload, user: dict, retry_row: dict | None = None) -> dict:
+    _apply_config_env()
+    phone = _validate_phone_number(payload.phone_number)
+    config = read_config()
+    livekit_url = config.get("livekit_url") or os.environ.get("LIVEKIT_URL", "")
+    api_key = config.get("livekit_api_key") or os.environ.get("LIVEKIT_API_KEY", "")
+    api_secret = config.get("livekit_api_secret") or os.environ.get("LIVEKIT_API_SECRET", "")
+    if not (livekit_url and api_key and api_secret):
+        raise HTTPException(status_code=500, detail="LiveKit is not configured")
+
+    try:
+        from livekit import api as lkapi
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"LiveKit SDK import failed: {e}")
+
+    dispatch_id = str(uuid.uuid4())
+    retry_count = int((retry_row or {}).get("retry_count") or 0) + (1 if retry_row else 0)
+    max_retries = int((retry_row or {}).get("max_retries") or db.MAX_CALL_RETRIES)
+    room_name = f"call-{phone.replace('+', '')}-{dispatch_id[:8]}"
+    db_call_id = (retry_row or {}).get("id")
+    if db_call_id:
+        db.update_call_log(
+            db_call_id,
+            status="dispatching",
+            failure_reason="",
+            room_name=room_name,
+            agent_id=payload.agent_id,
+            retry_count=retry_count,
+        )
+    else:
+        call_log = db.save_call_log(
+            phone=phone,
+            duration=0,
+            transcript="",
+            summary="Outbound call dispatching",
+            recording_url="",
+            caller_name="",
+            sentiment="pending",
+            owner_user_id=user.get("user_id"),
+            workspace_id=user.get("_workspace_id"),
+            status="dispatching",
+            retry_count=0,
+            max_retries=max_retries,
+            room_name=room_name,
+            agent_id=payload.agent_id,
+        )
+        db_call_id = call_log.get("id")
+
+    metadata = {
+        "phone_number": phone,
+        "agent_id": payload.agent_id,
+        "call_id": dispatch_id,
+        "db_call_id": db_call_id,
+        "retry_count": retry_count,
+        "max_retries": max_retries,
+        "user_id": user.get("user_id"),
+        "email": user.get("email"),
+        "workspace_id": user.get("_workspace_id"),
+    }
+    metadata = {k: v for k, v in metadata.items() if v is not None}
+
+    lk = lkapi.LiveKitAPI(url=livekit_url, api_key=api_key, api_secret=api_secret)
+    try:
+        dispatch = await lk.agent_dispatch.create_dispatch(
+            lkapi.CreateAgentDispatchRequest(
+                agent_name="outbound-caller",
+                room=room_name,
+                metadata=json.dumps(metadata),
+            )
+        )
+    except Exception as e:
+        if db_call_id:
+            db.mark_call_failed(db_call_id, "sip_failure", retry_count=retry_count, max_retries=max_retries)
+        raise HTTPException(status_code=502, detail=_friendly_livekit_error("Outbound call dispatch", e, livekit_url))
+    finally:
+        await lk.aclose()
+
+    if db_call_id:
+        db.update_call_log(db_call_id, status="dispatched", summary="Outbound call dispatched")
+
+    return {
+        "call_id": db_call_id or dispatch_id,
+        "dispatch_id": getattr(dispatch, "id", None),
+        "room_name": room_name,
+        "status": "dispatched",
+        "retry_count": retry_count,
+        "max_retries": max_retries,
+        "phone_number": phone,
+    }
+
+
+@app.post("/call")
+async def api_call(payload: CallPayload, user: dict = Depends(_require_auth)):
+    return await _dispatch_outbound_call(payload, user)
+
+
+@app.post("/api/call")
+async def api_call_prefixed(payload: CallPayload, user: dict = Depends(_require_auth)):
+    return await _dispatch_outbound_call(payload, user)
+
+
+async def _retry_due_calls_once() -> int:
+    _apply_config_env()
+    rows = db.claim_due_call_retries(limit=int(os.environ.get("CALL_RETRY_BATCH_SIZE", "5") or 5))
+    for row in rows:
+        user = {
+            "user_id": row.get("user_id"),
+            "email": "",
+            "_workspace_id": row.get("workspace_id"),
+        }
+        try:
+            await _dispatch_outbound_call(
+                CallPayload(phone_number=row.get("phone") or "", agent_id=row.get("agent_id")),
+                user,
+                retry_row=row,
+            )
+            logger.info("Retried call id=%s phone=%s retry_count=%s", row.get("id"), row.get("phone"), row.get("retry_count"))
+        except Exception as e:
+            logger.warning("Retry dispatch failed id=%s: %s", row.get("id"), e)
+    return len(rows)
+
+
+async def _retry_scheduler_loop() -> None:
+    interval = int(os.environ.get("CALL_RETRY_POLL_SECONDS", "60") or 60)
+    while True:
+        try:
+            await _retry_due_calls_once()
+        except Exception:
+            logger.exception("Retry scheduler loop failed")
+        await asyncio.sleep(interval)
+
+
+@app.on_event("startup")
+async def start_retry_scheduler() -> None:
+    if os.environ.get("DISABLE_CALL_RETRY_SCHEDULER", "").lower() in {"1", "true", "yes"}:
+        logger.info("Call retry scheduler disabled by env")
+        return
+    asyncio.create_task(_retry_scheduler_loop())
+
+
+@app.post("/api/call/retry-due")
+async def api_retry_due_calls(_user: dict = Depends(_require_admin)):
+    count = await _retry_due_calls_once()
+    return {"success": True, "claimed": count}
+
 @app.get("/api/config")
 async def api_get_config(_user: dict = Depends(_require_admin)):
     return read_config()
@@ -266,6 +478,11 @@ async def api_get_logs(user: dict = Depends(_require_auth)):
         logger.error(f"Error fetching logs: {e}")
         return []
 
+
+@app.get("/api/calls")
+async def api_get_calls(user: dict = Depends(_require_auth)):
+    return await api_get_logs(user)
+
 @app.get("/api/stats")
 async def api_get_stats(user: dict = Depends(_require_auth)):
     _apply_config_env()
@@ -273,7 +490,12 @@ async def api_get_stats(user: dict = Depends(_require_auth)):
         return db.fetch_stats(user_id=None, access_token=user.get("_access_token"))
     except Exception as e:
         logger.error(f"Error fetching stats: {e}")
-        return {"total_calls": 0, "total_bookings": 0, "avg_duration": 0, "booking_rate": 0}
+        return {"total_calls": 0, "answered_calls": 0, "failed_calls": 0, "total_bookings": 0, "avg_duration": 0, "average_duration": 0, "total_minutes": 0, "estimated_ai_cost": 0, "booking_rate": 0}
+
+
+@app.get("/api/analytics")
+async def api_get_analytics(user: dict = Depends(_require_auth)):
+    return await api_get_stats(user)
 
 @app.get("/api/contacts")
 async def api_get_contacts(user: dict = Depends(_require_auth)):
@@ -284,31 +506,42 @@ async def api_get_contacts(user: dict = Depends(_require_auth)):
         logger.error(f"Error fetching contacts: {e}")
         return []
 
+
+@app.get("/api/agents")
+async def api_get_agents(user: dict = Depends(_require_auth)):
+    _apply_config_env()
+    return db.fetch_agents(access_token=user.get("_access_token"))
+
+
+@app.get("/api/campaigns")
+async def api_get_campaigns(user: dict = Depends(_require_auth)):
+    _apply_config_env()
+    return db.fetch_campaigns(access_token=user.get("_access_token"))
+
+
+@app.get("/api/usage")
+async def api_get_usage(user: dict = Depends(_require_auth)):
+    _apply_config_env()
+    return db.fetch_usage(access_token=user.get("_access_token"))
+
+
+@app.get("/api/billing")
+async def api_get_billing(user: dict = Depends(_require_auth)):
+    _apply_config_env()
+    return db.fetch_billing_summary(access_token=user.get("_access_token"))
+
 @app.post("/api/call/single")
 async def api_call_single(request: Request, user: dict = Depends(_require_auth)):
     data = await request.json()
-    phone = (data.get("phone") or "").strip()
-    if not phone.startswith("+"):
-        return {"status": "error", "message": "Phone number must start with + and country code"}
-    config = read_config()
+    phone = data.get("phone_number") or data.get("phone") or data.get("to") or ""
     try:
-        import random, json as _json
-        from livekit import api as lkapi
-        lk = lkapi.LiveKitAPI(url=config.get("livekit_url") or os.environ.get("LIVEKIT_URL",""), api_key=config.get("livekit_api_key") or os.environ.get("LIVEKIT_API_KEY",""), api_secret=config.get("livekit_api_secret") or os.environ.get("LIVEKIT_API_SECRET",""))
-        room_name = f"call-{phone.replace('+','')}-{random.randint(1000,9999)}"
-        dispatch_meta = {
-            "phone_number": phone,
-            "user_id": user.get("user_id"),
-            "email": user.get("email"),
-            "workspace_id": user.get("_workspace_id"),
-        }
-        dispatch = await lk.agent_dispatch.create_dispatch(lkapi.CreateAgentDispatchRequest(
-            agent_name="outbound-caller",
-            room=room_name,
-            metadata=_json.dumps({k: v for k, v in dispatch_meta.items() if v is not None}),
-        ))
-        await lk.aclose()
-        return {"status": "ok", "dispatch_id": dispatch.id, "room": room_name, "phone": phone}
+        result = await _dispatch_outbound_call(
+            CallPayload(phone_number=phone, agent_id=data.get("agent_id")),
+            user,
+        )
+        return {"status": "ok", "room": result["room_name"], "phone": result["phone_number"], **result}
+    except HTTPException as e:
+        return {"status": "error", "message": e.detail}
     except Exception as e:
         return {"status": "error", "message": str(e)}
 

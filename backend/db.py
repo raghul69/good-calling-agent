@@ -1,11 +1,16 @@
 import logging
 import os
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List
 from urllib.parse import urlparse
 
 from supabase import Client, create_client
 
 logger = logging.getLogger("backend-db")
+
+RETRYABLE_CALL_FAILURES = {"no_answer", "busy", "sip_failure", "timeout"}
+MAX_CALL_RETRIES = int(os.getenv("MAX_CALL_RETRIES", "3") or 3)
+CALL_RETRY_DELAY_SECONDS = int(os.getenv("CALL_RETRY_DELAY_SECONDS", "300") or 300)
 
 
 def _supabase_settings(service_role: bool = False) -> tuple[str, str]:
@@ -99,6 +104,40 @@ def ensure_default_workspace(user_id: str) -> Dict[str, Any]:
         return {"success": False, "message": message}
 
 
+def fetch_workspace_summary(user: Dict[str, Any]) -> Dict[str, Any]:
+    workspace_id = user.get("_workspace_id")
+    if not workspace_id:
+        return {
+            "id": None,
+            "name": "Personal",
+            "role": user.get("role") or "user",
+            "member_count": 1,
+            "settings": {},
+        }
+    sb = get_supabase(service_role=True)
+    if not sb:
+        return {"id": workspace_id, "name": "Personal", "role": user.get("role") or "user", "member_count": 1, "settings": {}}
+    try:
+        workspace = sb.table("workspaces").select("id,name").eq("id", workspace_id).limit(1).execute()
+        members = sb.table("workspace_members").select("user_id,role").eq("workspace_id", workspace_id).execute()
+        settings = sb.table("workspace_settings").select("settings").eq("workspace_id", workspace_id).limit(1).execute()
+        member_rows = members.data or []
+        role = next(
+            (row.get("role") for row in member_rows if row.get("user_id") == user.get("user_id")),
+            user.get("role") or "member",
+        )
+        return {
+            "id": workspace_id,
+            "name": ((workspace.data or [{}])[0].get("name") or "Personal"),
+            "role": role,
+            "member_count": len(member_rows) or 1,
+            "settings": ((settings.data or [{}])[0].get("settings") or {}),
+        }
+    except Exception as e:
+        logger.error(f"Failed to fetch workspace summary: {_friendly_supabase_error('Fetch workspace', e)}")
+        return {"id": workspace_id, "name": "Personal", "role": user.get("role") or "member", "member_count": 1, "settings": {}}
+
+
 def save_call_log(
     phone: str,
     duration: int,
@@ -115,6 +154,12 @@ def save_call_log(
     interrupt_count: int = 0,
     owner_user_id: str | None = None,
     workspace_id: str | None = None,
+    status: str = "completed",
+    retry_count: int = 0,
+    max_retries: int | None = None,
+    failure_reason: str = "",
+    room_name: str = "",
+    agent_id: str | None = None,
 ) -> Dict[str, Any]:
     sb = get_supabase(service_role=True)
     if not sb:
@@ -134,6 +179,12 @@ def save_call_log(
         "call_day_of_week": call_day_of_week or "",
         "was_booked": bool(was_booked),
         "interrupt_count": int(interrupt_count or 0),
+        "status": status or "completed",
+        "retry_count": int(retry_count or 0),
+        "max_retries": int(max_retries if max_retries is not None else MAX_CALL_RETRIES),
+        "failure_reason": failure_reason or "",
+        "room_name": room_name or "",
+        "agent_id": agent_id,
     }
     if owner_user_id:
         payload["user_id"] = owner_user_id
@@ -147,6 +198,99 @@ def save_call_log(
         message = _friendly_supabase_error("Save call log", e)
         logger.error(f"Failed to save call log: {message}")
         return {"success": False, "message": message}
+
+
+def update_call_log(call_id: Any, **fields: Any) -> Dict[str, Any]:
+    if not call_id:
+        return {"success": False, "message": "call_id required"}
+    sb = get_supabase(service_role=True)
+    if not sb:
+        return {"success": False, "message": "Supabase not configured"}
+    clean = dict(fields)
+    if not clean:
+        return {"success": True}
+    try:
+        sb.table("call_logs").update(clean).eq("id", call_id).execute()
+        return {"success": True}
+    except Exception as e:
+        message = _friendly_supabase_error("Update call log", e)
+        logger.error(f"Failed to update call log {call_id}: {message}")
+        return {"success": False, "message": message}
+
+
+def mark_call_answered(call_id: Any, room_name: str = "") -> Dict[str, Any]:
+    return update_call_log(
+        call_id,
+        status="answered",
+        failure_reason="",
+        next_retry_at=None,
+        room_name=room_name,
+    )
+
+
+def mark_call_completed(call_id: Any, **fields: Any) -> Dict[str, Any]:
+    return update_call_log(call_id, status="completed", next_retry_at=None, **fields)
+
+
+def mark_call_failed(
+    call_id: Any,
+    reason: str,
+    retry_count: int = 0,
+    max_retries: int | None = None,
+    retryable: bool = True,
+) -> Dict[str, Any]:
+    max_attempts = int(max_retries if max_retries is not None else MAX_CALL_RETRIES)
+    next_count = int(retry_count or 0)
+    normalized_reason = reason if reason in RETRYABLE_CALL_FAILURES else "sip_failure"
+    should_retry = retryable and normalized_reason in RETRYABLE_CALL_FAILURES and next_count < max_attempts
+    next_retry_at = (
+        (datetime.now(timezone.utc) + timedelta(seconds=CALL_RETRY_DELAY_SECONDS)).isoformat()
+        if should_retry
+        else None
+    )
+    return update_call_log(
+        call_id,
+        status="retry_scheduled" if should_retry else "failed",
+        failure_reason=normalized_reason,
+        retry_count=next_count,
+        max_retries=max_attempts,
+        next_retry_at=next_retry_at,
+    )
+
+
+def claim_due_call_retries(limit: int = 5) -> List[Dict[str, Any]]:
+    sb = get_supabase(service_role=True)
+    if not sb:
+        return []
+    now = datetime.now(timezone.utc).isoformat()
+    try:
+        res = (
+            sb.table("call_logs")
+            .select("*")
+            .eq("status", "retry_scheduled")
+            .lte("next_retry_at", now)
+            .order("next_retry_at", desc=False)
+            .limit(limit)
+            .execute()
+        )
+        claimed: List[Dict[str, Any]] = []
+        for row in res.data or []:
+            if int(row.get("retry_count") or 0) >= int(row.get("max_retries") or MAX_CALL_RETRIES):
+                mark_call_failed(row.get("id"), row.get("failure_reason") or "sip_failure", row.get("retry_count") or 0, row.get("max_retries") or MAX_CALL_RETRIES, retryable=False)
+                continue
+            update = (
+                sb.table("call_logs")
+                .update({"status": "retrying", "next_retry_at": None})
+                .eq("id", row.get("id"))
+                .eq("status", "retry_scheduled")
+                .execute()
+            )
+            if update.data:
+                claimed.append(row)
+        return claimed
+    except Exception as e:
+        logger.error(f"Failed to claim due retries: {_friendly_supabase_error('Claim retries', e)}")
+        return []
 
 
 def fetch_call_logs(limit: int = 50, user_id: str | None = None, access_token: str | None = None) -> List[Dict[str, Any]]:
@@ -173,16 +317,36 @@ def fetch_call_logs(limit: int = 50, user_id: str | None = None, access_token: s
 def fetch_stats(user_id: str | None = None, access_token: str | None = None) -> Dict[str, Any]:
     logs = fetch_call_logs(limit=1000, user_id=user_id, access_token=access_token)
     if not logs:
-        return {"total_calls": 0, "total_bookings": 0, "avg_duration": 0, "booking_rate": 0}
+        return {
+            "total_calls": 0,
+            "answered_calls": 0,
+            "failed_calls": 0,
+            "total_bookings": 0,
+            "avg_duration": 0,
+            "average_duration": 0,
+            "total_minutes": 0,
+            "estimated_ai_cost": 0,
+            "booking_rate": 0,
+        }
 
     total_calls = len(logs)
+    answered_calls = sum(1 for r in logs if (r.get("status") in ("answered", "completed") or int(r.get("duration") or 0) > 0))
+    failed_calls = sum(1 for r in logs if r.get("status") == "failed")
     total_bookings = sum(1 for r in logs if bool(r.get("was_booked")))
-    avg_duration = round(sum(int(r.get("duration") or 0) for r in logs) / total_calls, 2)
+    total_duration = sum(int(r.get("duration") or 0) for r in logs)
+    avg_duration = round(total_duration / total_calls, 2)
+    total_minutes = round(total_duration / 60, 2)
+    estimated_ai_cost = round(sum(float(r.get("estimated_cost_usd") or 0) for r in logs), 4)
     booking_rate = round((total_bookings / total_calls) * 100, 2)
     return {
         "total_calls": total_calls,
+        "answered_calls": answered_calls,
+        "failed_calls": failed_calls,
         "total_bookings": total_bookings,
         "avg_duration": avg_duration,
+        "average_duration": avg_duration,
+        "total_minutes": total_minutes,
+        "estimated_ai_cost": estimated_ai_cost,
         "booking_rate": booking_rate,
     }
 
@@ -223,6 +387,61 @@ def fetch_contacts(user_id: str | None = None, access_token: str | None = None) 
     except Exception as e:
         logger.error(f"Failed to fetch contacts: {_friendly_supabase_error('Fetch contacts', e)}")
         return []
+
+
+def fetch_agents(access_token: str | None = None) -> List[Dict[str, Any]]:
+    sb = get_supabase(access_token=access_token)
+    if not sb:
+        return []
+    try:
+        res = sb.table("agents").select("*").order("created_at", desc=True).limit(100).execute()
+        return res.data or []
+    except Exception as e:
+        logger.error(f"Failed to fetch agents: {_friendly_supabase_error('Fetch agents', e)}")
+        return []
+
+
+def fetch_usage(access_token: str | None = None) -> List[Dict[str, Any]]:
+    sb = get_supabase(access_token=access_token)
+    if not sb:
+        return []
+    try:
+        res = sb.table("usage_events").select("*").order("created_at", desc=True).limit(500).execute()
+        return res.data or []
+    except Exception as e:
+        logger.error(f"Failed to fetch usage: {_friendly_supabase_error('Fetch usage', e)}")
+        return []
+
+
+def fetch_campaigns(access_token: str | None = None) -> List[Dict[str, Any]]:
+    sb = get_supabase(access_token=access_token)
+    if not sb:
+        return []
+    try:
+        res = sb.table("campaigns").select("*").order("created_at", desc=True).limit(100).execute()
+        return res.data or []
+    except Exception as e:
+        logger.info(f"Campaigns table unavailable or empty: {_friendly_supabase_error('Fetch campaigns', e)}")
+        return []
+
+
+def fetch_billing_summary(access_token: str | None = None) -> Dict[str, Any]:
+    stats = fetch_stats(access_token=access_token)
+    used_minutes = float(stats.get("total_minutes") or 0)
+    estimated_cost = float(stats.get("estimated_ai_cost") or 0)
+    included_minutes = int(os.getenv("BILLING_INCLUDED_MINUTES", "250") or 250)
+    overage_rate = float(os.getenv("BILLING_OVERAGE_RATE_USD", "0.18") or 0.18)
+    base_price = float(os.getenv("BILLING_BASE_PRICE_USD", "49") or 49)
+    overage_minutes = max(0.0, used_minutes - included_minutes)
+    return {
+        "plan": os.getenv("BILLING_PLAN_NAME", "Launch"),
+        "status": os.getenv("BILLING_STATUS", "trial"),
+        "included_minutes": included_minutes,
+        "used_minutes": round(used_minutes, 2),
+        "overage_minutes": round(overage_minutes, 2),
+        "estimated_ai_cost": round(estimated_cost, 4),
+        "next_invoice_estimate": round(base_price + (overage_minutes * overage_rate), 2),
+    }
 
 
 def auth_sign_up(email: str, password: str) -> Dict[str, Any]:

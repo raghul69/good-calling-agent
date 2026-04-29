@@ -2,20 +2,36 @@ import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import Login from './Login';
-import * as auth from './auth';
+
+const authMock = vi.hoisted(() => ({
+  getSession: vi.fn(),
+  signInWithPassword: vi.fn(),
+  signUp: vi.fn(),
+  signInWithOtp: vi.fn(),
+  verifyOtp: vi.fn(),
+}));
+
+vi.mock('./lib/supabase', () => ({
+  getAuthRedirectUrl: (path = '/agents') => `http://localhost${path}`,
+  isSupabaseConfigured: true,
+  supabase: {
+    auth: authMock,
+  },
+}));
+
+vi.mock('./lib/api', () => ({
+  apiConnectionMessage: 'Backend not connected. Add NEXT_PUBLIC_API_URL in Vercel production env.',
+  isApiConfigured: true,
+}));
 
 describe('Login page', () => {
   beforeEach(() => {
-    vi.restoreAllMocks();
-    vi.stubGlobal('fetch', vi.fn());
+    vi.clearAllMocks();
+    authMock.getSession.mockResolvedValue({ data: { session: null } });
   });
 
-  it('logs in and stores token on success', async () => {
-    const setTokenSpy = vi.spyOn(auth, 'setAccessToken').mockImplementation(() => {});
-    (globalThis.fetch as unknown as ReturnType<typeof vi.fn>).mockResolvedValue({
-      ok: true,
-      json: async () => ({ access_token: 'test-token' }),
-    });
+  it('logs in with Supabase on success', async () => {
+    authMock.signInWithPassword.mockResolvedValue({ error: null });
 
     render(
       <MemoryRouter>
@@ -32,19 +48,15 @@ describe('Login page', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Login' }));
 
     await waitFor(() => {
-      expect(globalThis.fetch).toHaveBeenCalledWith(
-        '/api/auth/login',
-        expect.objectContaining({ method: 'POST' }),
-      );
-      expect(setTokenSpy).toHaveBeenCalledWith('test-token');
+      expect(authMock.signInWithPassword).toHaveBeenCalledWith({
+        email: 'user@example.com',
+        password: 'password123',
+      });
     });
   });
 
   it('shows API error message on failed login', async () => {
-    (globalThis.fetch as unknown as ReturnType<typeof vi.fn>).mockResolvedValue({
-      ok: false,
-      json: async () => ({ detail: 'Invalid credentials' }),
-    });
+    authMock.signInWithPassword.mockResolvedValue({ error: { message: 'Invalid credentials' } });
 
     render(
       <MemoryRouter>

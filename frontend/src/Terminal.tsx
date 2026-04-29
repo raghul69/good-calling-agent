@@ -47,7 +47,7 @@ export default function TerminalPage() {
     xtermRef.current = term;
 
     // Initial Welcome Message
-    term.writeln('\x1b[1;36mRapidX Voice OS \x1b[0m\x1b[38;5;244mv2.0.0 (Antigravity IDE Edition)\x1b[0m');
+    term.writeln('\x1b[1;36mJettone \x1b[0m\x1b[38;5;244mv2.0.0 (Antigravity IDE Edition)\x1b[0m');
     term.writeln('\x1b[38;5;244mSystem Initialized. Waiting for execution...\x1b[0m\n');
     
     // Simulate initial loading

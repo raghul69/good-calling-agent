@@ -354,6 +354,7 @@ async def entrypoint(ctx: JobContext):
 
     # Try metadata first (outbound dispatch)
     metadata = ctx.job.metadata or ""
+    skip_sip_dial = False
     logger.info("[DISPATCH] Raw metadata: %s", metadata or "<empty>")
     if metadata:
         try:
@@ -366,6 +367,7 @@ async def entrypoint(ctx: JobContext):
             call_record_id = meta.get("db_call_id")
             retry_count = int(meta.get("retry_count") or 0)
             max_retries = int(meta.get("max_retries") or max_retries)
+            skip_sip_dial = bool(meta.get("skip_sip_dial"))
         except Exception as e:
             logger.warning("[DISPATCH] Failed to parse metadata: %s", e)
 
@@ -453,7 +455,7 @@ async def entrypoint(ctx: JobContext):
     agent_tools.room_name = ctx.room.name
 
     # ── Outbound SIP dial ────────────────────────────────────────────────
-    if phone_number and caller_phone not in ("unknown", "demo"):
+    if not skip_sip_dial and phone_number and caller_phone not in ("unknown", "demo"):
         outbound_trunk_id = os.getenv("OUTBOUND_TRUNK_ID", "").strip()
         if not outbound_trunk_id:
             logger.error("[SIP] OUTBOUND_TRUNK_ID is missing; cannot dial %s", caller_phone)

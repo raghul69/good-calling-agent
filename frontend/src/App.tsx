@@ -341,18 +341,33 @@ const agentTabs = [
   ['Inbound', PhoneIncoming],
 ] as const;
 
-function ShellButton({ children, primary = false, danger = false, className = '', onClick }: { children: React.ReactNode; primary?: boolean; danger?: boolean; className?: string; onClick?: () => void }) {
+function ShellButton({
+  children,
+  primary = false,
+  danger = false,
+  className = '',
+  onClick,
+  disabled = false,
+}: {
+  children: React.ReactNode;
+  primary?: boolean;
+  danger?: boolean;
+  className?: string;
+  onClick?: () => void;
+  disabled?: boolean;
+}) {
   return (
     <button
       type="button"
       onClick={onClick}
+      disabled={disabled}
       className={`inline-flex min-h-10 items-center justify-center gap-2 rounded-md border px-4 text-sm font-semibold shadow-sm transition ${
         primary
           ? 'border-blue-600 bg-blue-600 text-white hover:bg-blue-700'
           : danger
             ? 'border-slate-200 bg-white text-slate-900 hover:border-red-200 hover:bg-red-50 hover:text-red-700'
             : 'border-slate-200 bg-white text-slate-950 hover:bg-slate-50'
-      } ${className}`}
+      } disabled:cursor-not-allowed disabled:opacity-50 ${className}`}
     >
       {children}
     </button>
@@ -381,6 +396,21 @@ function Agents() {
   const [search, setSearch] = useState('');
   const [activeTab, setActiveTab] = useState('Agent');
   const [saved, setSaved] = useState(false);
+  const [callBusy, setCallBusy] = useState<'browser' | 'phone' | 'sip' | null>(null);
+  const [callStatus, setCallStatus] = useState<{ tone: 'success' | 'error'; message: string } | null>(null);
+  const [sipTestReady, setSipTestReady] = useState(false);
+
+  useEffect(() => {
+    if (!isApiConfigured) return;
+    (async () => {
+      try {
+        const [sip, lk] = await Promise.all([api.sipHealth(), api.livekitHealth()]);
+        setSipTestReady(Boolean(sip.ok && lk.ok && lk.api_reachable));
+      } catch {
+        setSipTestReady(false);
+      }
+    })();
+  }, []);
 
   useEffect(() => {
     (async () => {
@@ -406,6 +436,51 @@ function Agents() {
   const updateSelected = (fields: Partial<DemoAgent>) => {
     setSaved(false);
     setAgents((current) => current.map((agent) => (agent.id === selected.id ? { ...agent, ...fields } : agent)));
+  };
+  const runBrowserTest = async () => {
+    setCallBusy('browser');
+    setCallStatus(null);
+    try {
+      const result = await api.browserTest(selected.id);
+      setCallStatus({
+        tone: 'success',
+        message: `Browser test ready in room ${result.roomName}. LiveKit agent dispatched.`,
+      });
+    } catch (error: any) {
+      setCallStatus({ tone: 'error', message: error?.message || 'Browser test failed.' });
+    } finally {
+      setCallBusy(null);
+    }
+  };
+  const runPhoneCall = async () => {
+    setCallBusy('phone');
+    setCallStatus(null);
+    try {
+      const result = await api.outboundCall(selected.phone, selected.id);
+      setCallStatus({
+        tone: 'success',
+        message: `Outbound call dispatched to ${result.phone_number} in room ${result.room_name}.`,
+      });
+    } catch (error: any) {
+      setCallStatus({ tone: 'error', message: error?.message || 'Phone call failed.' });
+    } finally {
+      setCallBusy(null);
+    }
+  };
+  const runSipTestCall = async () => {
+    setCallBusy('sip');
+    setCallStatus(null);
+    try {
+      const result = await api.sipTestCall(selected.phone, selected.id);
+      setCallStatus({
+        tone: 'success',
+        message: `SIP test succeeded — room ${result.room_name}, callee ${result.phone_number_masked}, ${result.sip_status}.`,
+      });
+    } catch (error: any) {
+      setCallStatus({ tone: 'error', message: error?.message || 'SIP test failed.' });
+    } finally {
+      setCallBusy(null);
+    }
   };
 
   return (
@@ -534,7 +609,9 @@ function Agents() {
 
         <aside className="space-y-5 border-l border-slate-200 bg-white p-4">
           <div className="rounded-lg border border-slate-200 p-4">
-            <ShellButton primary className="mb-4 w-full"><PhoneIncoming size={20} /> Get call from agent</ShellButton>
+            <ShellButton primary className="mb-4 w-full" onClick={runPhoneCall}>
+              <PhoneIncoming size={20} /> {callBusy === 'phone' ? 'Calling...' : 'Get call from agent'}
+            </ShellButton>
             <div className="mb-2 flex items-center justify-between gap-2">
               <div className="flex min-h-11 flex-1 items-center gap-2 rounded-md bg-slate-100 px-3 font-bold">
                 <PhoneCall size={20} />
@@ -554,8 +631,29 @@ function Agents() {
             <p className="mt-3 border-b border-slate-200 pb-5 text-sm italic text-slate-500">Updated 8 days ago</p>
             <ShellButton className="mt-6 w-full bg-slate-100 text-blue-600"><ChatCircleText size={20} /> Chat with agent</ShellButton>
             <p className="mt-3 text-center text-sm text-slate-500">Chat is the fastest way to test and refine.</p>
+            {callStatus && (
+              <div className={`mt-4 rounded-md border px-3 py-2 text-sm ${
+                callStatus.tone === 'success'
+                  ? 'border-emerald-200 bg-emerald-50 text-emerald-800'
+                  : 'border-red-200 bg-red-50 text-red-700'
+              }`}>
+                {callStatus.message}
+              </div>
+            )}
             <div className="mt-6 rounded-lg border border-dashed border-slate-300 p-4 text-center">
-              <ShellButton className="w-full border-dashed"><Flask size={20} /> Test via browser <span className="rounded bg-slate-100 px-2 py-1 text-xs text-slate-500">BETA</span></ShellButton>
+              <ShellButton className="w-full border-dashed" onClick={runBrowserTest}>
+                <Flask size={20} /> {callBusy === 'browser' ? 'Starting...' : 'Test via browser'} <span className="rounded bg-slate-100 px-2 py-1 text-xs text-slate-500">BETA</span>
+              </ShellButton>
+              <ShellButton
+                className="mt-3 w-full border-dashed border-amber-200 bg-amber-50/80 text-amber-950"
+                onClick={runSipTestCall}
+                disabled={!sipTestReady || callBusy !== null}
+              >
+                <PhoneCall size={20} /> {callBusy === 'sip' ? 'Testing SIP...' : 'Test SIP Call'}
+              </ShellButton>
+              {!sipTestReady && isApiConfigured && (
+                <p className="mt-2 text-xs text-slate-500">SIP test unlocks when LiveKit and SIP trunk health checks pass.</p>
+              )}
               <p className="mt-3 text-xs text-slate-500">For best experience, use "Get call from agent"</p>
             </div>
           </div>

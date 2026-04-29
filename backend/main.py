@@ -5,6 +5,7 @@ import json
 import re
 import uuid
 import asyncio
+from datetime import datetime, timezone
 from fastapi import FastAPI, HTTPException, Depends, Request, Header
 from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
@@ -114,6 +115,64 @@ def health_check():
 def health_check_root():
     return health_check()
 
+
+@app.get("/api/livekit/health")
+async def api_livekit_health():
+    """Public probe: LiveKit env completeness and optional list_rooms reachability (no secrets in response)."""
+    _apply_config_env()
+    config = read_config()
+    livekit_url = (config.get("livekit_url") or os.environ.get("LIVEKIT_URL", "")).strip()
+    status = _livekit_config_status()
+    if not status.get("configured") or not status.get("url_valid"):
+        return {
+            "ok": False,
+            "livekit": status,
+            "room_count": None,
+            "api_reachable": False,
+        }
+    try:
+        from livekit import api as lkapi
+
+        lk = lkapi.LiveKitAPI(
+            url=livekit_url,
+            api_key=config.get("livekit_api_key") or os.environ.get("LIVEKIT_API_KEY", ""),
+            api_secret=config.get("livekit_api_secret") or os.environ.get("LIVEKIT_API_SECRET", ""),
+        )
+        rooms = await lk.room.list_rooms(lkapi.ListRoomsRequest())
+        await lk.aclose()
+        return {
+            "ok": True,
+            "livekit": status,
+            "room_count": len(rooms.rooms),
+            "api_reachable": True,
+        }
+    except Exception as e:
+        return {
+            "ok": False,
+            "livekit": status,
+            "room_count": None,
+            "api_reachable": False,
+            "error": _friendly_livekit_error("LiveKit API health", e, livekit_url),
+        }
+
+
+@app.get("/api/sip/health")
+def api_sip_health():
+    """Public probe: trunk id present and LiveKit URL/keys configured (trunk id is a resource id, not a secret)."""
+    _apply_config_env()
+    lk = _livekit_config_status()
+    trunk = _sip_trunk_id()
+    trunk_configured = bool(trunk)
+    livekit_ok = bool(lk.get("configured") and lk.get("url_valid"))
+    return {
+        "ok": trunk_configured and livekit_ok,
+        "trunk_configured": trunk_configured,
+        "livekit_configured": livekit_ok,
+        "sip_trunk_id": trunk or None,
+        "livekit": lk,
+    }
+
+
 # Provide some placeholder routes from old ui_server logic during transition
 # Allow running this file directly (`python backend/main.py`) and as module.
 if __package__ in (None, ""):
@@ -146,6 +205,27 @@ class CallPayload(BaseModel):
     agent_id: str | None = None
 
 
+class LiveKitTokenPayload(BaseModel):
+    room_name: str | None = None
+    participant_identity: str | None = None
+    participant_name: str | None = None
+    agent_id: str | None = None
+
+
+class BrowserTestPayload(BaseModel):
+    agent_id: str | None = None
+
+
+class OutboundCallPayload(BaseModel):
+    phone_number: str
+    agent_id: str | None = None
+
+
+class SipTestCallPayload(BaseModel):
+    phone_number: str
+    agent_id: str | None = "test-agent"
+
+
 PHONE_RE = re.compile(r"^\+[1-9]\d{7,15}$")
 
 
@@ -168,6 +248,46 @@ def _apply_config_env() -> None:
         os.environ.setdefault("SUPABASE_ANON_KEY", config.get("supabase_key", ""))
     if config.get("supabase_service_role_key"):
         os.environ["SUPABASE_SERVICE_ROLE_KEY"] = config.get("supabase_service_role_key", "")
+    lk_sip_trunk = (os.environ.get("LIVEKIT_SIP_TRUNK_ID") or "").strip()
+    if lk_sip_trunk:
+        os.environ.setdefault("OUTBOUND_TRUNK_ID", lk_sip_trunk)
+        os.environ.setdefault("SIP_TRUNK_ID", lk_sip_trunk)
+    if config.get("sip_trunk_id"):
+        os.environ.setdefault("OUTBOUND_TRUNK_ID", config.get("sip_trunk_id", ""))
+        os.environ.setdefault("SIP_TRUNK_ID", config.get("sip_trunk_id", ""))
+
+
+def _sip_trunk_id() -> str:
+    """Resolved outbound SIP trunk id (non-secret resource id)."""
+    _apply_config_env()
+    config = read_config()
+    for candidate in (
+        (os.environ.get("OUTBOUND_TRUNK_ID") or "").strip(),
+        (os.environ.get("LIVEKIT_SIP_TRUNK_ID") or "").strip(),
+        (os.environ.get("SIP_TRUNK_ID") or "").strip(),
+        (config.get("sip_trunk_id") or "").strip(),
+    ):
+        if candidate:
+            return candidate
+    return ""
+
+
+def _mask_phone_e164(phone: str) -> str:
+    clean = re.sub(r"[\s().-]+", "", (phone or "").strip())
+    if len(clean) < 5:
+        return "****"
+    return f"…{clean[-4:]}"
+
+
+def _sip_failure_reason(exc: Exception) -> str:
+    failure_text = str(exc).lower()
+    if "busy" in failure_text:
+        return "busy"
+    if "timeout" in failure_text or "timed out" in failure_text:
+        return "timeout"
+    if "no answer" in failure_text or "no_answer" in failure_text:
+        return "no_answer"
+    return "sip_failure"
 
 
 def _livekit_config_status() -> dict:
@@ -196,6 +316,71 @@ def _friendly_livekit_error(action: str, error: Exception, livekit_url: str) -> 
             "Check LIVEKIT_URL, internet/DNS access, and Render environment variables."
         )
     return message
+
+
+def _livekit_credentials() -> tuple[str, str, str]:
+    _apply_config_env()
+    config = read_config()
+    livekit_url = (config.get("livekit_url") or os.environ.get("LIVEKIT_URL", "")).strip()
+    api_key = (config.get("livekit_api_key") or os.environ.get("LIVEKIT_API_KEY", "")).strip()
+    api_secret = (config.get("livekit_api_secret") or os.environ.get("LIVEKIT_API_SECRET", "")).strip()
+    if not (livekit_url and api_key and api_secret):
+        raise HTTPException(status_code=500, detail="LiveKit is not configured. Set LIVEKIT_URL, LIVEKIT_API_KEY, and LIVEKIT_API_SECRET.")
+    return livekit_url, api_key, api_secret
+
+
+def _agent_name() -> str:
+    return os.environ.get("LIVEKIT_AGENT_NAME", "outbound-caller")
+
+
+def _new_room_name(prefix: str, value: str = "") -> str:
+    suffix = re.sub(r"[^a-zA-Z0-9]+", "", value or "")[:18].lower()
+    return "-".join(part for part in [prefix, suffix, str(uuid.uuid4())[:8]] if part)
+
+
+def _participant_token(
+    livekit_url: str,
+    api_key: str,
+    api_secret: str,
+    room_name: str,
+    identity: str,
+    name: str,
+    metadata: dict | None = None,
+) -> dict:
+    from livekit.api import AccessToken, VideoGrants
+
+    token = (
+        AccessToken(api_key, api_secret)
+        .with_identity(identity)
+        .with_name(name)
+        .with_metadata(json.dumps(metadata or {}))
+        .with_grants(VideoGrants(room_join=True, room=room_name, can_publish=True, can_subscribe=True))
+        .with_ttl(3600)
+        .to_jwt()
+    )
+    return {"roomName": room_name, "room": room_name, "token": token, "url": livekit_url}
+
+
+async def _create_livekit_room(lk: any, lkapi: any, livekit_url: str, room_name: str) -> None:
+    try:
+        await lk.room.create_room(lkapi.CreateRoomRequest(name=room_name))
+    except Exception as e:
+        message = str(e).lower()
+        if "already" not in message and "exists" not in message:
+            raise HTTPException(status_code=502, detail=_friendly_livekit_error("LiveKit room create", e, livekit_url))
+
+
+async def _dispatch_agent_to_room(lk: any, lkapi: any, livekit_url: str, room_name: str, metadata: dict) -> any:
+    try:
+        return await lk.agent_dispatch.create_dispatch(
+            lkapi.CreateAgentDispatchRequest(
+                agent_name=_agent_name(),
+                room=room_name,
+                metadata=json.dumps({k: v for k, v in metadata.items() if v is not None}),
+            )
+        )
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=_friendly_livekit_error("LiveKit agent dispatch", e, livekit_url))
 
 
 def _require_auth(authorization: str = Header(default="")) -> dict:
@@ -305,6 +490,216 @@ async def api_workspace(user: dict = Depends(_require_auth)):
     return db.fetch_workspace_summary(user)
 
 
+@app.post("/api/livekit/token")
+async def api_livekit_token(payload: LiveKitTokenPayload, user: dict = Depends(_require_auth)):
+    livekit_url, api_key, api_secret = _livekit_credentials()
+    room_name = payload.room_name or _new_room_name("browser", payload.agent_id or user.get("user_id") or "user")
+    identity = payload.participant_identity or f"browser-{user.get('user_id') or uuid.uuid4()}"
+    metadata = {
+        "agent_id": payload.agent_id,
+        "user_id": user.get("user_id"),
+        "email": user.get("email"),
+        "workspace_id": user.get("_workspace_id"),
+        "is_browser_test": True,
+    }
+    return _participant_token(
+        livekit_url,
+        api_key,
+        api_secret,
+        room_name,
+        identity,
+        payload.participant_name or "Browser Tester",
+        metadata,
+    )
+
+
+@app.post("/api/calls/browser-test")
+async def api_calls_browser_test(payload: BrowserTestPayload, user: dict = Depends(_require_auth)):
+    livekit_url, api_key, api_secret = _livekit_credentials()
+    from livekit import api as lkapi
+
+    room_name = _new_room_name("browser", payload.agent_id or user.get("user_id") or "agent")
+    started_at = datetime.now(timezone.utc).isoformat()
+    call_log = db.save_call_log(
+        phone="browser",
+        duration=0,
+        transcript="",
+        summary="Browser LiveKit test started",
+        recording_url="",
+        caller_name=user.get("email") or "Browser Tester",
+        sentiment="pending",
+        owner_user_id=user.get("user_id"),
+        workspace_id=user.get("_workspace_id"),
+        status="dispatching",
+        room_name=room_name,
+        agent_id=payload.agent_id,
+        started_at=started_at,
+    )
+    db_call_id = call_log.get("id")
+    metadata = {
+        "phone_number": "demo",
+        "is_demo": True,
+        "is_browser_test": True,
+        "agent_id": payload.agent_id,
+        "db_call_id": db_call_id,
+        "user_id": user.get("user_id"),
+        "email": user.get("email"),
+        "workspace_id": user.get("_workspace_id"),
+    }
+
+    lk = lkapi.LiveKitAPI(url=livekit_url, api_key=api_key, api_secret=api_secret)
+    try:
+        await _create_livekit_room(lk, lkapi, livekit_url, room_name)
+        dispatch = await _dispatch_agent_to_room(lk, lkapi, livekit_url, room_name, metadata)
+    finally:
+        await lk.aclose()
+
+    if db_call_id:
+        db.update_call_log(db_call_id, status="dispatched", summary="Browser LiveKit test dispatched")
+
+    token_payload = _participant_token(
+        livekit_url,
+        api_key,
+        api_secret,
+        room_name,
+        f"browser-{user.get('user_id') or uuid.uuid4()}",
+        "Browser Tester",
+        metadata,
+    )
+    return {
+        **token_payload,
+        "call_id": db_call_id,
+        "dispatch_id": getattr(dispatch, "id", None),
+        "status": "dispatched",
+        "started_at": started_at,
+    }
+
+
+@app.post("/api/calls/outbound")
+async def api_calls_outbound(payload: OutboundCallPayload, user: dict = Depends(_require_auth)):
+    _apply_config_env()
+    if not _sip_trunk_id():
+        raise HTTPException(
+            status_code=500,
+            detail="SIP trunk not configured. Set LIVEKIT_SIP_TRUNK_ID or OUTBOUND_TRUNK_ID.",
+        )
+    return await _dispatch_outbound_call(
+        CallPayload(phone_number=payload.phone_number, agent_id=payload.agent_id),
+        user,
+    )
+
+
+@app.post("/api/sip/test-call")
+async def api_sip_test_call(payload: SipTestCallPayload, user: dict = Depends(_require_auth)):
+    """Create room, place outbound SIP via LiveKit API (sync errors), then dispatch agent with skip_sip_dial."""
+    _apply_config_env()
+    trunk_id = _sip_trunk_id()
+    if not trunk_id:
+        raise HTTPException(
+            status_code=400,
+            detail="SIP trunk not configured. Set LIVEKIT_SIP_TRUNK_ID or OUTBOUND_TRUNK_ID.",
+        )
+    phone = _validate_phone_number(payload.phone_number)
+    livekit_url, api_key, api_secret = _livekit_credentials()
+    try:
+        from livekit import api as lkapi
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"LiveKit SDK import failed: {e}")
+
+    dispatch_id = str(uuid.uuid4())
+    room_name = f"sip-test-{phone.replace('+', '')}-{dispatch_id[:8]}"
+    started_at = datetime.now(timezone.utc).isoformat()
+    call_log = db.save_call_log(
+        phone=phone,
+        duration=0,
+        transcript="",
+        summary="SIP test call dispatching",
+        recording_url="",
+        caller_name="",
+        sentiment="pending",
+        owner_user_id=user.get("user_id"),
+        workspace_id=user.get("_workspace_id"),
+        status="dispatching",
+        retry_count=0,
+        max_retries=db.MAX_CALL_RETRIES,
+        room_name=room_name,
+        agent_id=payload.agent_id,
+        started_at=started_at,
+    )
+    db_call_id = call_log.get("id")
+    sip_identity = f"sip_{phone.replace('+', '')}"
+    metadata = {
+        "phone_number": phone,
+        "agent_id": payload.agent_id,
+        "call_id": dispatch_id,
+        "db_call_id": db_call_id,
+        "retry_count": 0,
+        "max_retries": db.MAX_CALL_RETRIES,
+        "user_id": user.get("user_id"),
+        "email": user.get("email"),
+        "workspace_id": user.get("_workspace_id"),
+        "skip_sip_dial": True,
+    }
+    metadata = {k: v for k, v in metadata.items() if v is not None}
+
+    lk = lkapi.LiveKitAPI(url=livekit_url, api_key=api_key, api_secret=api_secret)
+    try:
+        await _create_livekit_room(lk, lkapi, livekit_url, room_name)
+        try:
+            await lk.sip.create_sip_participant(
+                lkapi.CreateSIPParticipantRequest(
+                    sip_trunk_id=trunk_id,
+                    sip_call_to=phone,
+                    room_name=room_name,
+                    participant_identity=sip_identity,
+                    participant_name=phone,
+                    wait_until_answered=True,
+                )
+            )
+        except Exception as e:
+            reason = _sip_failure_reason(e)
+            if db_call_id:
+                db.mark_call_failed(db_call_id, reason, retry_count=0, max_retries=db.MAX_CALL_RETRIES)
+            logger.warning(
+                "SIP test dial failed room=%s trunk_id=%s dest=%s reason=%s error=%s",
+                room_name,
+                trunk_id,
+                _mask_phone_e164(phone),
+                reason,
+                str(e)[:500],
+            )
+            raise HTTPException(
+                status_code=502,
+                detail=_friendly_livekit_error("SIP outbound dial", e, livekit_url),
+            )
+        if db_call_id:
+            db.mark_call_answered(db_call_id, room_name=room_name)
+        dispatch = await _dispatch_agent_to_room(lk, lkapi, livekit_url, room_name, metadata)
+    finally:
+        await lk.aclose()
+
+    if db_call_id:
+        db.update_call_log(db_call_id, status="dispatched", summary="SIP test call dispatched")
+
+    logger.info(
+        "SIP test call ok room=%s trunk_id=%s dest=%s dispatch_id=%s",
+        room_name,
+        trunk_id,
+        _mask_phone_e164(phone),
+        getattr(dispatch, "id", None),
+    )
+    return {
+        "status": "ok",
+        "room_name": room_name,
+        "phone_number_masked": _mask_phone_e164(phone),
+        "sip_status": "answered",
+        "dispatch_id": getattr(dispatch, "id", None),
+        "call_id": db_call_id or dispatch_id,
+        "agent_id": payload.agent_id,
+        "started_at": started_at,
+    }
+
+
 async def _dispatch_outbound_call(payload: CallPayload, user: dict, retry_row: dict | None = None) -> dict:
     _apply_config_env()
     phone = _validate_phone_number(payload.phone_number)
@@ -324,6 +719,7 @@ async def _dispatch_outbound_call(payload: CallPayload, user: dict, retry_row: d
     retry_count = int((retry_row or {}).get("retry_count") or 0) + (1 if retry_row else 0)
     max_retries = int((retry_row or {}).get("max_retries") or db.MAX_CALL_RETRIES)
     room_name = f"call-{phone.replace('+', '')}-{dispatch_id[:8]}"
+    started_at = datetime.now(timezone.utc).isoformat()
     db_call_id = (retry_row or {}).get("id")
     if db_call_id:
         db.update_call_log(
@@ -333,6 +729,7 @@ async def _dispatch_outbound_call(payload: CallPayload, user: dict, retry_row: d
             room_name=room_name,
             agent_id=payload.agent_id,
             retry_count=retry_count,
+            started_at=started_at,
         )
     else:
         call_log = db.save_call_log(
@@ -350,6 +747,7 @@ async def _dispatch_outbound_call(payload: CallPayload, user: dict, retry_row: d
             max_retries=max_retries,
             room_name=room_name,
             agent_id=payload.agent_id,
+            started_at=started_at,
         )
         db_call_id = call_log.get("id")
 
@@ -368,9 +766,10 @@ async def _dispatch_outbound_call(payload: CallPayload, user: dict, retry_row: d
 
     lk = lkapi.LiveKitAPI(url=livekit_url, api_key=api_key, api_secret=api_secret)
     try:
+        await _create_livekit_room(lk, lkapi, livekit_url, room_name)
         dispatch = await lk.agent_dispatch.create_dispatch(
             lkapi.CreateAgentDispatchRequest(
-                agent_name="outbound-caller",
+                agent_name=_agent_name(),
                 room=room_name,
                 metadata=json.dumps(metadata),
             )
@@ -393,6 +792,7 @@ async def _dispatch_outbound_call(payload: CallPayload, user: dict, retry_row: d
         "retry_count": retry_count,
         "max_retries": max_retries,
         "phone_number": phone,
+        "started_at": started_at,
     }
 
 

@@ -22,8 +22,50 @@ export type CallNowResponse = {
   call_id: string;
   dispatch_id?: string;
   room_name: string;
+  roomName?: string;
   status: string;
   phone_number: string;
+  token?: string;
+  url?: string;
+  started_at?: string;
+};
+
+export type LiveKitBrowserTestResponse = {
+  call_id?: string;
+  dispatch_id?: string;
+  roomName: string;
+  room: string;
+  token: string;
+  url: string;
+  status: string;
+  started_at: string;
+};
+
+export type SipHealthResponse = {
+  ok: boolean;
+  trunk_configured: boolean;
+  livekit_configured: boolean;
+  sip_trunk_id?: string | null;
+  livekit: Record<string, unknown>;
+};
+
+export type LiveKitHealthResponse = {
+  ok: boolean;
+  livekit: Record<string, unknown>;
+  room_count: number | null;
+  api_reachable: boolean;
+  error?: string;
+};
+
+export type SipTestCallResponse = {
+  status: string;
+  room_name: string;
+  phone_number_masked: string;
+  sip_status: string;
+  dispatch_id?: string | null;
+  call_id?: string | number | null;
+  agent_id?: string | null;
+  started_at?: string;
 };
 
 export type CurrentUser = {
@@ -140,6 +182,8 @@ export async function apiFetchWithFallback<T>(paths: string[], fallback: T): Pro
 
 export const api = {
   health: () => apiFetch<Record<string, unknown>>("/api/health"),
+  sipHealth: () => apiFetch<SipHealthResponse>("/api/sip/health"),
+  livekitHealth: () => apiFetch<LiveKitHealthResponse>("/api/livekit/health"),
   me: () => apiFetch<CurrentUser>("/api/auth/me"),
   workspace: () => apiFetch<WorkspaceSummary>("/api/workspace"),
   billing: () => apiFetch<BillingSummary>("/api/billing"),
@@ -166,6 +210,26 @@ export const api = {
       body: JSON.stringify(config),
     }),
   demoToken: () => apiFetch<{ token?: string; room?: string; url?: string; error?: string }>("/api/demo-token"),
+  livekitToken: (room_name?: string, agent_id?: string) =>
+    apiFetch<{ roomName: string; room: string; token: string; url: string }>("/api/livekit/token", {
+      method: "POST",
+      body: JSON.stringify({ room_name, agent_id }),
+    }),
+  browserTest: (agent_id?: string) =>
+    apiFetch<LiveKitBrowserTestResponse>("/api/calls/browser-test", {
+      method: "POST",
+      body: JSON.stringify({ agent_id }),
+    }),
+  outboundCall: (phone_number: string, agent_id?: string) =>
+    apiFetch<CallNowResponse>("/api/calls/outbound", {
+      method: "POST",
+      body: JSON.stringify({ phone_number, agent_id }),
+    }),
+  sipTestCall: (phone_number: string, agent_id?: string) =>
+    apiFetch<SipTestCallResponse>("/api/sip/test-call", {
+      method: "POST",
+      body: JSON.stringify({ phone_number, agent_id: agent_id ?? "test-agent" }),
+    }),
   callNow: (phone_number: string, agent_id?: string) =>
     apiFetch<CallNowResponse>("/call", {
       method: "POST",

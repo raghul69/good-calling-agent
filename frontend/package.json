@@ -8,7 +8,7 @@
     "build": "vite build",
     "lint": "eslint .",
     "preview": "vite preview",
-    "test": "vitest run --pool=forks",
+    "test": "vitest run --pool=threads --maxWorkers=1 --no-file-parallelism",
     "test:watch": "vitest"
   },
   "dependencies": {

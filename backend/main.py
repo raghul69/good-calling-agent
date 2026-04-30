@@ -5,6 +5,7 @@ import json
 import re
 import uuid
 import asyncio
+import secrets
 from datetime import datetime, timezone
 from fastapi import FastAPI, HTTPException, Depends, Request, Header
 from pydantic import BaseModel
@@ -154,6 +155,22 @@ async def api_livekit_health():
             "api_reachable": False,
             "error": _friendly_livekit_error("LiveKit API health", e, livekit_url),
         }
+
+
+@app.get("/api/debug/internal-test-config")
+def api_debug_internal_test_config():
+    enabled_raw = os.environ.get("ENABLE_INTERNAL_TEST_CALLS")
+    enabled_normalized = (enabled_raw or "").strip().lower()
+    route_registered = any(
+        route.path == "/api/calls/outbound-test" and "POST" in (route.methods or set())
+        for route in app.routes
+    )
+    return {
+        "enabled_present": enabled_raw is not None,
+        "enabled_value_is_true": enabled_normalized == "true",
+        "secret_present": bool((os.environ.get("INTERNAL_TEST_CALL_SECRET") or "").strip()),
+        "route_registered": route_registered,
+    }
 
 
 @app.get("/api/sip/health")
@@ -579,6 +596,24 @@ async def api_calls_browser_test(payload: BrowserTestPayload, user: dict = Depen
 async def api_calls_outbound(payload: OutboundCallPayload, user: dict = Depends(_require_auth)):
     _apply_config_env()
     if not _sip_trunk_id():
+        phone = _validate_phone_number(payload.phone_number)
+        started_at = datetime.now(timezone.utc).isoformat()
+        db.save_call_log(
+            phone=phone,
+            duration=0,
+            transcript="",
+            summary="Outbound call failed: SIP trunk not configured",
+            recording_url="",
+            caller_name="",
+            sentiment="failed",
+            owner_user_id=user.get("user_id"),
+            workspace_id=user.get("_workspace_id"),
+            status="failed",
+            failure_reason="sip_failure",
+            room_name="",
+            agent_id=payload.agent_id,
+            started_at=started_at,
+        )
         raise HTTPException(
             status_code=500,
             detail="SIP trunk not configured. Set LIVEKIT_SIP_TRUNK_ID or OUTBOUND_TRUNK_ID.",
@@ -586,6 +621,66 @@ async def api_calls_outbound(payload: OutboundCallPayload, user: dict = Depends(
     return await _dispatch_outbound_call(
         CallPayload(phone_number=payload.phone_number, agent_id=payload.agent_id),
         user,
+    )
+
+
+def _internal_outbound_test_enabled() -> bool:
+    v = (os.environ.get("ENABLE_INTERNAL_TEST_CALLS") or "").strip().lower()
+    return v in {"1", "true", "yes"}
+
+
+def _verify_internal_test_secret(header_value: str | None) -> None:
+    # Intentionally return 404 when disabled/misconfigured to avoid advertising this route.
+    enabled = _internal_outbound_test_enabled()
+    if not enabled:
+        raise HTTPException(status_code=404, detail="Not found")
+    expected = (os.environ.get("INTERNAL_TEST_CALL_SECRET") or "").strip()
+    if not expected:
+        raise HTTPException(status_code=404, detail="Not found")
+    provided = (header_value or "").strip()
+    secret_match = secrets.compare_digest(expected, provided)
+    if not secret_match:
+        raise HTTPException(status_code=401, detail="Invalid internal test secret")
+
+
+@app.post("/api/calls/outbound-test")
+async def api_calls_outbound_test(
+    payload: OutboundCallPayload,
+    x_internal_test_secret: str | None = Header(default=None, alias="X-Internal-Test-Secret"),
+):
+    _apply_config_env()
+    _verify_internal_test_secret(x_internal_test_secret)
+    if not _sip_trunk_id():
+        phone = _validate_phone_number(payload.phone_number)
+        started_at = datetime.now(timezone.utc).isoformat()
+        db.save_call_log(
+            phone=phone,
+            duration=0,
+            transcript="",
+            summary="Outbound test call failed: SIP trunk not configured",
+            recording_url="",
+            caller_name="",
+            sentiment="failed",
+            owner_user_id=None,
+            workspace_id=None,
+            status="failed",
+            failure_reason="sip_failure",
+            room_name="",
+            agent_id=payload.agent_id,
+            started_at=started_at,
+        )
+        raise HTTPException(
+            status_code=500,
+            detail="SIP trunk not configured. Set LIVEKIT_SIP_TRUNK_ID or OUTBOUND_TRUNK_ID.",
+        )
+    test_user = {
+        "user_id": None,
+        "email": "",
+        "_workspace_id": None,
+    }
+    return await _dispatch_outbound_call(
+        CallPayload(phone_number=payload.phone_number, agent_id=payload.agent_id),
+        test_user,
     )
 
 

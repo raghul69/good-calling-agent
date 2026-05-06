@@ -178,6 +178,13 @@ def _normalize_voice_text(text: str) -> str:
     return re.sub(r"[^a-z0-9\u0b80-\u0bff]+", " ", str(text or "").lower()).strip()
 
 
+def _looks_placeholder_secret(value: str) -> bool:
+    low = str(value or "").strip().lower()
+    if not low:
+        return True
+    return low.startswith(("your_", "sk-your", "replace_", "changeme", "todo"))
+
+
 def _is_confused_user(text: str) -> bool:
     low = _normalize_voice_text(text)
     if not low:
@@ -1103,6 +1110,19 @@ async def entrypoint(ctx: JobContext):
     stt_language  = live_config.get("stt_language", "unknown")  # auto-detect (#20)
     tts_model     = str(live_config.get("tts_model") or "bulbul:v3").strip() or "bulbul:v3"
     stt_model     = str(live_config.get("stt_model") or "").strip()
+    live_openai_key = str(live_config.get("openai_api_key") or "").strip()
+    env_openai_key = str(os.getenv("OPENAI_API_KEY") or "").strip()
+    live_groq_key = str(live_config.get("groq_api_key") or "").strip()
+    env_groq_key = str(os.getenv("GROQ_API_KEY") or "").strip()
+    openai_ready = not _looks_placeholder_secret(live_openai_key or env_openai_key)
+    groq_ready = not _looks_placeholder_secret(live_groq_key or env_groq_key)
+    if llm_provider == "openai" and not openai_ready and groq_ready:
+        llm_provider = "groq"
+        live_config["llm_provider"] = "groq"
+        if not str(live_config.get("llm_model") or "").strip() or str(live_config.get("llm_model")).startswith("gpt-"):
+            live_config["llm_model"] = "llama-3.1-8b-instant"
+            llm_model = live_config["llm_model"]
+        logger.warning("[LLM_PROVIDER_FALLBACK] from=openai to=groq reason=openai_key_missing_or_placeholder")
     if stt_provider == "deepgram" and not os.getenv("DEEPGRAM_API_KEY", "").strip():
         logger.warning("[STT] Deepgram selected but DEEPGRAM_API_KEY is not set — falling back to Sarvam")
         stt_provider = "sarvam"
@@ -1133,10 +1153,13 @@ async def entrypoint(ctx: JobContext):
 
     # Override OS env vars from UI config
     for key in ["LIVEKIT_URL","LIVEKIT_API_KEY","LIVEKIT_API_SECRET","OPENAI_API_KEY",
-                "SARVAM_API_KEY","CAL_API_KEY","TELEGRAM_BOT_TOKEN","SUPABASE_URL",
+                "GROQ_API_KEY","SARVAM_API_KEY","CAL_API_KEY","TELEGRAM_BOT_TOKEN","SUPABASE_URL",
                 "SUPABASE_KEY","SUPABASE_SERVICE_ROLE_KEY"]:
         val = live_config.get(key.lower(), "")
         if val:
+            if key.endswith("_KEY") and _looks_placeholder_secret(str(val)):
+                logger.warning("[ENV_OVERRIDE_SKIPPED] key=%s reason=placeholder", key)
+                continue
             os.environ[key] = val
 
     # ── Caller memory (#15) ───────────────────────────────────────────────

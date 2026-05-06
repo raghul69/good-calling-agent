@@ -83,6 +83,13 @@ class FastVoiceRouter:
             result.intent or "-",
             result.needs_llm,
         )
+        if result.handled:
+            logger.info(
+                "[FAST_ROUTER_HIT] stage=%s intent=%s message=%s",
+                self.state.stage,
+                result.intent or "-",
+                (result.message or "")[:120],
+            )
         return result
 
     def mark_agent_reply(self, text: str, *, question_key: str = "") -> None:

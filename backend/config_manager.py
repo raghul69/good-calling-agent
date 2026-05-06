@@ -27,7 +27,7 @@ def read_config():
         "stt_min_endpointing_delay": float(get_val("stt_min_endpointing_delay", "STT_MIN_ENDPOINTING_DELAY", 0.6)),
         "llm_model": get_val("llm_model", "LLM_MODEL", "gpt-4o-mini"),
         "tts_voice": get_val("tts_voice", "TTS_VOICE", "kavya"),
-        "tts_language": get_val("tts_language", "TTS_LANGUAGE", "hi-IN"),
+        "tts_language": get_val("tts_language", "TTS_LANGUAGE", "en-IN"),
         "livekit_url": get_val("livekit_url", "LIVEKIT_URL", ""),
         "sip_trunk_id": get_val("sip_trunk_id", "SIP_TRUNK_ID", ""),
         "livekit_api_key": get_val("livekit_api_key", "LIVEKIT_API_KEY", ""),

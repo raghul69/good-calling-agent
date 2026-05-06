@@ -130,7 +130,7 @@ def get_live_config(phone_number: str | None = None):
         "llm_model":                config.get("llm_model", "gpt-4o-mini"),
         "llm_provider":             config.get("llm_provider", "openai"),
         "tts_voice":                config.get("tts_voice", "kavya"),
-        "tts_language":             config.get("tts_language", "hi-IN"),
+        "tts_language":             config.get("tts_language", "en-IN"),
         "tts_model":                config.get("tts_model", "bulbul:v3"),
         "tts_provider":             config.get("tts_provider", "sarvam"),
         "stt_provider":             config.get("stt_provider", "sarvam"),
@@ -166,6 +166,7 @@ _CONFUSION_RE = re.compile(
     re.IGNORECASE,
 )
 _QUESTION_RE = re.compile(r"[?？]\s*$|\b(sollunga|tell me|can you|will you|shall we|pannalama)\b", re.IGNORECASE)
+_TTS_SPEAKABLE_RE = re.compile(r"[A-Za-z0-9\u0900-\u097f\u0b80-\u0bff]")
 
 
 def _split_sentences(text: str) -> list[str]:
@@ -198,11 +199,21 @@ def _limit_voice_words(text: str, max_words: int = 12) -> str:
     return trimmed.rstrip(".,!?।") + "."
 
 
+def _sanitize_tts_text(text: str) -> str:
+    cleaned = re.sub(r"\s+", " ", str(text or "")).strip()
+    cleaned = re.sub(r"([.!?।]){2,}", r"\1", cleaned)
+    cleaned = re.sub(r"\.\s*\?", "?", cleaned)
+    cleaned = cleaned.strip(" \t\r\n,;:")
+    if not _TTS_SPEAKABLE_RE.search(cleaned):
+        return ""
+    return cleaned
+
+
 def _voice_tts_chunks(text: str, max_words: int = 12) -> tuple[list[str], int]:
     raw = str(text or "").strip()
     sentences = _split_sentences(raw)
     first_sentence = next((s for s in sentences if "?" in s), sentences[0] if sentences else raw)
-    chunk = _limit_voice_words(first_sentence, max_words=max_words)
+    chunk = _sanitize_tts_text(_limit_voice_words(first_sentence, max_words=max_words))
     return ([chunk] if chunk else []), len(sentences)
 
 
@@ -540,8 +551,9 @@ class OutboundAssistant(Agent):
         return cleaned
 
     async def _say_guarded(self, line: str, *, allow_interruptions: bool = True, wait: bool = False) -> None:
-        text = self._dedupe_reply(line)
+        text = _sanitize_tts_text(self._dedupe_reply(line))
         if not text:
+            logger.info("[TTS_CHUNK_SKIPPED] reason=no_speakable_text")
             return
         speak_start = time.perf_counter()
         handle = self.session.say(text, allow_interruptions=allow_interruptions)
@@ -603,6 +615,10 @@ class OutboundAssistant(Agent):
                 if raw_sentence_count > 1:
                     logger.info("[TTS_CHUNK_COUNT] raw_sentences=%s enforced_chunks=%s", raw_sentence_count, len(chunks))
                 for chunk in chunks[:1]:
+                    chunk = _sanitize_tts_text(chunk)
+                    if not chunk:
+                        logger.info("[TTS_CHUNK_SKIPPED] reason=no_speakable_text")
+                        continue
                     chunk_count += 1
                     if not first_logged:
                         first_logged = True
@@ -618,6 +634,10 @@ class OutboundAssistant(Agent):
                 if raw_sentence_count > 1:
                     logger.info("[TTS_CHUNK_COUNT] raw_sentences=%s enforced_chunks=%s", raw_sentence_count, len(chunks))
                 for chunk in chunks[:1]:
+                    chunk = _sanitize_tts_text(chunk)
+                    if not chunk:
+                        logger.info("[TTS_CHUNK_SKIPPED] reason=no_speakable_text")
+                        continue
                     chunk_count += 1
                     if not first_logged:
                         first_logged = True
@@ -1077,7 +1097,7 @@ async def entrypoint(ctx: JobContext):
     llm_model     = live_config.get("llm_model", "gpt-4o-mini")
     llm_provider  = str(live_config.get("llm_provider", "openai") or "openai").lower()
     tts_voice     = live_config.get("tts_voice", "kavya")
-    tts_language  = live_config.get("tts_language", "hi-IN")
+    tts_language  = live_config.get("tts_language", "en-IN")
     tts_provider  = str(live_config.get("tts_provider", "sarvam") or "sarvam").lower()
     stt_provider  = str(live_config.get("stt_provider", "sarvam") or "sarvam").lower()
     stt_language  = live_config.get("stt_language", "unknown")  # auto-detect (#20)

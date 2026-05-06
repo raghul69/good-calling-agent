@@ -1892,8 +1892,8 @@ async def entrypoint(ctx: JobContext):
                 try:
                     import openai as _oai
                     _oai_key = (os.getenv("OPENAI_API_KEY") or "").strip()
-                    if not _oai_key:
-                        logger.debug("[SENTIMENT] skipped OPENAI_API_KEY unset")
+                    if _looks_placeholder_secret(_oai_key):
+                        logger.debug("[SENTIMENT] skipped OPENAI_API_KEY missing_or_placeholder")
                     else:
                         _client = _oai.AsyncOpenAI(api_key=_oai_key)
                         resp = await _client.chat.completions.create(

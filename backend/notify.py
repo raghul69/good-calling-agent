@@ -11,12 +11,17 @@ TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID", "")
 TELEGRAM_URL       = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
 
 
+def _looks_placeholder(value: str) -> bool:
+    low = str(value or "").strip().lower()
+    return not low or low.startswith(("your_", "replace_", "changeme", "todo"))
+
+
 # ─── Telegram ──────────────────────────────────────────────────────────────────
 
 def send_telegram(message: str) -> bool:
     """Fire a single POST to Telegram. Supports Markdown formatting."""
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        logger.warning("[TELEGRAM] Token or Chat ID not set — skipping.")
+    if _looks_placeholder(TELEGRAM_BOT_TOKEN) or _looks_placeholder(TELEGRAM_CHAT_ID):
+        logger.info("[TELEGRAM] Token or Chat ID missing/placeholder — skipping.")
         return False
     try:
         resp = requests.post(

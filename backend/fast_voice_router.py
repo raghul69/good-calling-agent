@@ -85,14 +85,15 @@ class FastVoiceRouter:
         )
         if result.handled:
             logger.info(
-                "[FAST_ROUTER_HIT] stage=%s intent=%s message=%s",
+                "[FAST_ROUTER_HIGH_CONFIDENCE] stage=%s intent=%s confidence=%s message=%s",
                 self.state.stage,
                 result.intent or "-",
+                result.confidence,
                 (result.message or "")[:120],
             )
         elif result.intent:
             logger.info(
-                "[ROUTER_LOW_CONFIDENCE] stage=%s intent=%s confidence=%s",
+                "[FAST_ROUTER_LOW_CONFIDENCE_SKIPPED] stage=%s intent=%s confidence=%s",
                 self.state.stage,
                 result.intent,
                 result.confidence,

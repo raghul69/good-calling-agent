@@ -173,6 +173,7 @@ _EXIT_INTENT_RE = re.compile(
     r"\b(thank\s*you|thanks|bye|goodbye|cut|cut\s+call|go\s+home|not\s+interested|vendam|venam|podhum)\b",
     re.IGNORECASE,
 )
+FRAGMENT_RECOVERY_LINE = "Sorry sir, voice konjam break aagudhu."
 
 
 def _split_sentences(text: str) -> list[str]:
@@ -542,15 +543,17 @@ class OutboundAssistant(Agent):
         self.response_sent_for_turn = False
         self.is_waiting_for_user = False
         self.conversation_ended = False
+        self.greeting_sent = False
         self._last_committed_user_norm = ""
         self._fallback_used_stages: set[str] = set()
+        self._high_confidence_intents_used: set[str] = set()
         live_config_loaded = self._live_config
         self._response_timeout_s = float(live_config_loaded.get("response_timeout_seconds") or 1.2)
         self._fast_pipeline_enabled = (
             str(live_config_loaded.get("vertical") or "").strip().lower() == "tamil_real_estate"
             or str(live_config_loaded.get("response_latency_mode") or "").strip().lower() == "fast"
         )
-        logger.info("[HYBRID_MODE_ENABLED] fast_router_high_confidence_only=true controller_guard_only=true")
+        logger.info("[HYBRID_NATURAL_MODE] livekit_groq_main=true controller_guard_only=true fast_router_high_confidence_only=true")
         self._fast_router = FastVoiceRouter()
         self._active_response_task: asyncio.Task[Any] | None = None
         self._barge_in = BargeInController()
@@ -581,11 +584,7 @@ class OutboundAssistant(Agent):
 
     def _fallback_recovery_line(self, user_text: str = "") -> str:
         self._confusion_count += 1
-        if self._confusion_count <= 1:
-            return "Sorry sir, simple-ah sollren. Site visit interest irukka?"
-        if self._confusion_count == 2:
-            return "Sorry, clear-ah pesaren. Which area prefer panreenga?"
-        return "No problem sir. English-la sollren, property options venuma?"
+        return FRAGMENT_RECOVERY_LINE
 
     def _dedupe_reply(self, line: str) -> str:
         cleaned = re.sub(r"\s+", " ", str(line or "")).strip()
@@ -636,6 +635,15 @@ class OutboundAssistant(Agent):
             return
         self._mark_response_sent(source=source)
 
+    def _is_repeated_high_confidence_intro(self, intent: str) -> bool:
+        if intent not in {"hello", "what_is_it"}:
+            return False
+        if intent in self._high_confidence_intents_used:
+            logger.info("[GREETING_REPEAT_BLOCKED] turn_id=%s intent=%s", self.current_turn_id, intent)
+            return True
+        self._high_confidence_intents_used.add(intent)
+        return False
+
     def _fallback_allowed_for_stage(self) -> bool:
         stage = str(self._fast_router.state.stage or "unknown")
         if stage in self._fallback_used_stages:
@@ -660,7 +668,7 @@ class OutboundAssistant(Agent):
             return
         if lifecycle != "greeting" and not _is_valid_voice_response(text):
             logger.info("[FRAGMENT_BLOCKED] source=%s text=%s", lifecycle or "say_guarded", text[:120])
-            return
+            text = FRAGMENT_RECOVERY_LINE
         speak_start = time.perf_counter()
         handle = self.session.say(text, allow_interruptions=allow_interruptions)
         publish_ms = _ms_since(speak_start)
@@ -686,6 +694,9 @@ class OutboundAssistant(Agent):
             self._barge_in.interrupt(self.session, self._active_response_task, reason=f"early_intent:{result.intent}")
 
     async def on_enter(self):
+        if self.greeting_sent:
+            logger.info("[GREETING_REPEAT_BLOCKED] source=on_enter")
+            return
         greeting = self._live_config.get("first_line") or self._first_line or FALLBACK_FIRST_LINE
         try:
             logger.info(
@@ -700,6 +711,7 @@ class OutboundAssistant(Agent):
             logger.info("[GREETING_TTS_STARTED] chars=%s direct_tts=true", len(greeting or ""))
             logger.info("[WELCOME_TTS_START] chars=%s direct_tts=true", len(greeting or ""))
             await self._say_guarded(greeting, allow_interruptions=True, wait=True, lifecycle="greeting")
+            self.greeting_sent = True
         except Exception as e:
             logger.exception("[GREETING_FAILED] exception=%s first_line=%s", e, str(greeting or "").strip())
             raise
@@ -721,6 +733,8 @@ class OutboundAssistant(Agent):
                 return len(stripped.split()) >= 7
 
             async for raw_chunk in text:
+                if self.current_turn_id > 0 and first_logged is False and not self._can_send_for_current_turn(source="livekit_natural_tts"):
+                    return
                 raw_text = str(raw_chunk or "")
                 if not raw_text:
                     continue
@@ -741,10 +755,12 @@ class OutboundAssistant(Agent):
                         continue
                     if not _is_valid_voice_response(chunk):
                         logger.info("[FRAGMENT_BLOCKED] source=livekit_tts_stream text=%s", chunk[:120])
-                        continue
+                        chunk = FRAGMENT_RECOVERY_LINE
                     chunk_count += 1
                     if not first_logged:
                         first_logged = True
+                        if self.current_turn_id > 0:
+                            self._mark_response_sent(source="livekit_natural_tts")
                         logger.info("[TTS_FIRST_CHUNK_MS] ms=%s chars=%s", _ms_since(tts_start), len(chunk))
                     logger.info("[TTS_TEXT_LENGTH] chunk=%s chars=%s words=%s", chunk_count, len(chunk), len(chunk.split()))
                     if len(chunk) > 120:
@@ -763,10 +779,14 @@ class OutboundAssistant(Agent):
                         continue
                     if not _is_valid_voice_response(chunk):
                         logger.info("[FRAGMENT_BLOCKED] source=livekit_tts_stream text=%s", chunk[:120])
-                        continue
+                        chunk = FRAGMENT_RECOVERY_LINE
                     chunk_count += 1
                     if not first_logged:
                         first_logged = True
+                        if self.current_turn_id > 0:
+                            if not self._can_send_for_current_turn(source="livekit_natural_tts"):
+                                return
+                            self._mark_response_sent(source="livekit_natural_tts")
                         logger.info("[TTS_FIRST_CHUNK_MS] ms=%s chars=%s", _ms_since(tts_start), len(chunk))
                     logger.info("[TTS_TEXT_LENGTH] chunk=%s chars=%s words=%s", chunk_count, len(chunk), len(chunk.split()))
                     if len(chunk) > 120:
@@ -832,7 +852,12 @@ class OutboundAssistant(Agent):
             self._fast_router.start_turn()
             fast_action = self._fast_router.route_final(text)
             if fast_action.handled and fast_action.message and fast_action.confidence >= 0.9:
+                if self._is_repeated_high_confidence_intro(fast_action.intent or ""):
+                    self.is_waiting_for_user = True
+                    logger.info("[WAITING_FOR_USER] turn_id=%s source=repeated_high_confidence_intro", self.current_turn_id)
+                    raise StopResponse()
                 logger.info("[FAST_PIPELINE] llm_skipped intent=%s stage=%s", fast_action.intent, fast_action.stage)
+                logger.info("[FAST_ROUTER_HIGH_CONFIDENCE] turn_id=%s intent=%s confidence=%s", self.current_turn_id, fast_action.intent or "-", fast_action.confidence)
                 logger.info("[CONTROLLER_OWNED_REPLY] turn_id=%s source=fast_router intent=%s", self.current_turn_id, fast_action.intent or "-")
                 logger.info("[LIVEKIT_REPLY_SKIPPED_HIGH_CONFIDENCE] turn_id=%s intent=%s", self.current_turn_id, fast_action.intent or "-")
                 self._voice_latency.log(
@@ -843,13 +868,13 @@ class OutboundAssistant(Agent):
                 await self._say_guarded(fast_action.message, allow_interruptions=True, lifecycle="fast_router")
                 raise StopResponse()
             logger.info(
-                "[ROUTER_LOW_CONFIDENCE] turn_id=%s intent=%s confidence=%s handled=%s",
+                "[FAST_ROUTER_LOW_CONFIDENCE_SKIPPED] turn_id=%s intent=%s confidence=%s handled=%s",
                 self.current_turn_id,
                 fast_action.intent or "complex",
                 fast_action.confidence,
                 fast_action.handled,
             )
-            logger.info("[LIVEKIT_REPLY_ALLOWED] turn_id=%s reason=normal_conversation", self.current_turn_id)
+            logger.info("[LIVEKIT_NATURAL_REPLY_ALLOWED] turn_id=%s reason=normal_conversation", self.current_turn_id)
             return
         if _is_confused_user(text):
             logger.info("[CONFUSION_DETECTED] text=%s", text[:120])
@@ -857,7 +882,7 @@ class OutboundAssistant(Agent):
                 logger.info("[CONTROLLER_OWNED_REPLY] turn_id=%s source=confusion_fallback", self.current_turn_id)
                 await self._say_guarded(self._fallback_recovery_line(text), allow_interruptions=True, lifecycle="confusion_fallback")
             raise StopResponse()
-        logger.info("[LIVEKIT_REPLY_ALLOWED] turn_id=%s reason=controller_guard_only", self.current_turn_id)
+        logger.info("[LIVEKIT_NATURAL_REPLY_ALLOWED] turn_id=%s reason=controller_guard_only", self.current_turn_id)
         return
 
 

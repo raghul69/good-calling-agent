@@ -10,6 +10,7 @@ import secrets
 import hashlib
 import threading
 import time
+from contextlib import asynccontextmanager
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
@@ -18,7 +19,7 @@ from pydantic import BaseModel, Field
 from openai import AsyncOpenAI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
 from fastapi.exceptions import RequestValidationError
 from urllib.parse import urlparse
 
@@ -34,7 +35,29 @@ import backend.db as db
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("backend-api")
 
-app = FastAPI(title="RapidX AI Dashboard API", version="2.0.0")
+
+@asynccontextmanager
+async def _app_lifespan(_app: FastAPI):
+    retry_task: asyncio.Task | None = None
+    if os.environ.get("DISABLE_CALL_RETRY_SCHEDULER", "").lower() in {"1", "true", "yes"}:
+        logger.info("Call retry scheduler disabled by env")
+    else:
+        retry_task = asyncio.create_task(_retry_scheduler_loop())
+
+    await _log_deployment_integration()
+
+    try:
+        yield
+    finally:
+        if retry_task is not None:
+            retry_task.cancel()
+            try:
+                await retry_task
+            except asyncio.CancelledError:
+                pass
+
+
+app = FastAPI(title="RapidX AI Dashboard API", version="2.0.0", lifespan=_app_lifespan)
 
 _RL_LOCK = threading.Lock()
 _RL_STORE: defaultdict[str, list[float]] = defaultdict(list)
@@ -297,6 +320,7 @@ def health_check():
         "ok": True,
         "mvp_env_ready": mvp_ready,
         "providers": providers,
+        "voice_pipeline": os.environ.get("VOICE_PIPELINE", "livekit_agents"),
         "missing": missing,
         "status": "ok",
         "timestamp": datetime.datetime.utcnow().isoformat(),
@@ -305,6 +329,8 @@ def health_check():
         "supabase_configured": supabase_status.get("configured", False),
         "service_role_key_present": supabase_status.get("service_role_key_present", False),
         "livekit_configured": livekit_status.get("configured", False),
+        "sip_trunk_configured": sip_present,
+        "groq_or_openai_configured": groq_present or openai_present,
         "integrations": {
             "supabase": supabase_status,
             "livekit": livekit_status,
@@ -1217,9 +1243,10 @@ def _provider_options_payload() -> dict:
         },
         "deepgram_configured": bool(os.getenv("DEEPGRAM_API_KEY", "").strip()),
         "engine_defaults": {
-            "stt_min_endpointing_delay": 0.05,
-            "max_turns": 14,
-            "silence_timeout_seconds": 45,
+            "stt_min_endpointing_delay": 0.25,
+            "max_turns": 8,
+            "silence_timeout_seconds": 6,
+            "response_latency_mode": "fast",
         },
     }
 
@@ -1886,7 +1913,6 @@ async def _retry_scheduler_loop() -> None:
         await asyncio.sleep(interval)
 
 
-@app.on_event("startup")
 async def start_retry_scheduler() -> None:
     if os.environ.get("DISABLE_CALL_RETRY_SCHEDULER", "").lower() in {"1", "true", "yes"}:
         logger.info("Call retry scheduler disabled by env")
@@ -1911,7 +1937,6 @@ async def api_post_config(request: Request, _user: dict = Depends(_require_admin
     return {"status": "success"}
 
 
-@app.on_event("startup")
 async def _log_deployment_integration() -> None:
     """One-shot integration probe for Railway/Vercel/Supabase — safe values only."""
     _apply_config_env()
@@ -2459,9 +2484,34 @@ frontend_dist = os.path.join(os.path.dirname(__file__), "..", "frontend", "dist"
 app.mount("/assets", StaticFiles(directory=os.path.join(frontend_dist, "assets")), name="assets") if os.path.isdir(os.path.join(frontend_dist, "assets")) else None
 
 @app.get("/{full_path:path}")
-async def serve_frontend(full_path: str):
+async def serve_frontend(full_path: str, request: Request):
     index_path = os.path.join(frontend_dist, "index.html")
     if os.path.exists(index_path):
         with open(index_path) as f:
             return HTMLResponse(f.read())
-    return HTMLResponse("<h1>Frontend not built. Run 'npm run build' in /frontend</h1>")
+
+    app_url = _public_app_url()
+    parsed_app = urlparse(app_url)
+    request_host = request.url.netloc.lower()
+    app_host = parsed_app.netloc.lower()
+    if parsed_app.scheme in {"http", "https"} and app_host and "localhost" not in app_host and app_host != request_host:
+        suffix = f"/{full_path}" if full_path else ""
+        query = f"?{request.url.query}" if request.url.query else ""
+        return RedirectResponse(f"{app_url}{suffix}{query}", status_code=307)
+
+    return HTMLResponse(
+        """
+        <main style="font-family: system-ui, sans-serif; max-width: 760px; margin: 48px auto; line-height: 1.5;">
+          <h1>RapidX AI Voice API</h1>
+          <p>The backend and LiveKit voice worker are running on Railway.</p>
+          <p>Deploy the dashboard from <code>frontend/</code> on Vercel and set <code>NEXT_PUBLIC_API_URL</code> to this Railway API URL.</p>
+          <ul>
+            <li><a href="/health">/health</a></li>
+            <li><a href="/api/health">/api/health</a></li>
+            <li><a href="/api/livekit/health">/api/livekit/health</a></li>
+            <li><a href="/api/sip/health">/api/sip/health</a></li>
+          </ul>
+        </main>
+        """,
+        status_code=200,
+    )

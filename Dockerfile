@@ -1,64 +1,25 @@
-# ══════════════════════════════════════════════════════════════════════════════
-# Multi-stage Dockerfile (#26) — smaller image, faster deploys
-# Stage 1: Build dependencies
-# Stage 2: Lean runtime image
-# ══════════════════════════════════════════════════════════════════════════════
+# Backend API (uvicorn) + LiveKit voice worker via supervisord.
+# UI is deployed separately on Vercel — this image does not ship frontend/dist.
 
-# ── Stage 1: Frontend Builder ───────────────────────────────────────────────────
-FROM node:20-slim AS frontend-builder
-WORKDIR /app
-COPY frontend/package*.json ./
-RUN npm ci || npm install
-COPY frontend/ ./
-RUN npm run build
+FROM python:3.11-bookworm
 
-# ── Stage 2: Backend Builder ──────────────────────────────────────────────────
-FROM python:3.11-slim AS backend-builder
-
-WORKDIR /app
-
-# System deps for building native packages
-RUN apt-get update && apt-get install -y \
-    build-essential \
-    curl \
-    ca-certificates \
+RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy and install Python deps into user local (isolated from system)
-COPY requirements.txt .
-RUN pip install --no-cache-dir --user -r requirements.txt
-
-
-# ── Stage 3: Runtime ──────────────────────────────────────────────────────────
-FROM python:3.11-slim AS runtime
-
 WORKDIR /app
-
-# Only the runtime system deps needed (supervisor + CA certs)
-RUN apt-get update && apt-get install -y \
-    supervisor \
-    ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
-
-# Copy installed packages from builder stage
-COPY --from=backend-builder /root/.local /root/.local
-# Copy compiled frontend from frontend stage
-COPY --from=frontend-builder /app/dist ./frontend/dist
-
-# Copy application code
-COPY . .
-
-# Copy supervisor config
-COPY supervisord.conf /etc/supervisor/conf.d/supervisord.conf
-
-# Make sure scripts in .local are usable
-ENV PATH=/root/.local/bin:$PATH
+ENV PYTHONPATH=/app
 ENV PYTHONUNBUFFERED=1
-ENV PYTHONDONTWRITEBYTECODE=1
-ENV PORT=8000
 
-# Expose UI port and LiveKit agent port
-EXPOSE 8000 8081
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt \
+    && pip install --no-cache-dir supervisor==4.2.5
 
-# Start both services via supervisord
-CMD ["/usr/bin/supervisord", "-c", "/etc/supervisor/conf.d/supervisord.conf"]
+COPY backend ./backend
+COPY artifacts ./artifacts
+COPY supervisord.conf .
+
+RUN mkdir -p /app/configs
+
+EXPOSE 8000
+
+CMD ["supervisord", "-n", "-c", "/app/supervisord.conf"]

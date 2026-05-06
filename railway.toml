@@ -1,10 +1,11 @@
-# Railway config-as-code: https://docs.railway.com/deploy/config-as-code
-# Set service "Root Directory" to this folder (InboundAIVoice) when the Git repo root is a monorepo.
+# Railway Blueprint for InboundAIVoice (Dockerfile + supervisord).
+# Set Railway project Root Directory to this folder (`InboundAIVoice`).
+# Railway injects PORT; uvicorn uses it in supervisord.conf.
 
 [build]
-builder = "DOCKERFILE"
-dockerfilePath = "Dockerfile"
+builder = "dockerfile"
 
 [deploy]
 healthcheckPath = "/health"
-healthcheckTimeout = 120
+healthcheckTimeout = 300
+restartPolicyType = "ON_FAILURE"

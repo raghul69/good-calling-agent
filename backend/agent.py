@@ -128,8 +128,8 @@ def get_live_config(phone_number: str | None = None):
     return {
         "agent_instructions":       config.get("agent_instructions", ""),
         "stt_min_endpointing_delay":config.get("stt_min_endpointing_delay", 0.05),
-        "llm_model":                config.get("llm_model", "gpt-4o-mini"),
-        "llm_provider":             config.get("llm_provider", "openai"),
+        "llm_model":                config.get("llm_model", "llama-3.1-8b-instant"),
+        "llm_provider":             config.get("llm_provider", "groq"),
         "tts_voice":                config.get("tts_voice", "kavya"),
         "tts_language":             config.get("tts_language", "en-IN"),
         "tts_model":                config.get("tts_model", "bulbul:v3"),
@@ -248,6 +248,70 @@ def _sanitize_tts_text(text: str) -> str:
     return cleaned
 
 
+def _prompt_text_from_config(config: dict) -> str:
+    for key in ("agent_instructions", "system_prompt", "prompt"):
+        value = str(config.get(key) or "").strip()
+        if value:
+            return value
+    return ""
+
+
+def _prompt_hash(text: str) -> str:
+    return hashlib.sha256(str(text or "").encode("utf-8")).hexdigest()[:12] if text else ""
+
+
+def _language_profile_from_config(config: dict) -> str:
+    lang_cfg = config.get("language_config") if isinstance(config.get("language_config"), dict) else {}
+    parts = [
+        str(config.get("lang_preset") or "").strip(),
+        str(lang_cfg.get("language") or "").strip(),
+        str(lang_cfg.get("style") or "").strip(),
+        str(lang_cfg.get("tone") or "").strip(),
+        str(lang_cfg.get("formality") or "").strip(),
+    ]
+    return " / ".join([p for p in parts if p]) or "-"
+
+
+def _normalize_runtime_prompt_config(config: dict) -> str:
+    prompt = _prompt_text_from_config(config)
+    config["agent_instructions"] = prompt
+    config["system_prompt"] = prompt
+    config["prompt"] = prompt
+    return prompt
+
+
+def _compact_agent_prompt(prompt: str, *, max_chars: int = 900) -> str:
+    text = re.sub(r"\s+", " ", str(prompt or "")).strip()
+    if not text:
+        return ""
+    priority_terms = (
+        "tamil",
+        "tanglish",
+        "chennai",
+        "sales",
+        "property",
+        "real estate",
+        "budget",
+        "area",
+        "site visit",
+        "one sentence",
+        "short",
+        "natural",
+    )
+    sentences = _split_sentences(text)
+    selected: list[str] = []
+    for sentence in sentences:
+        low = sentence.lower()
+        if any(term in low for term in priority_terms):
+            selected.append(sentence)
+        if len(" ".join(selected)) >= max_chars:
+            break
+    compact = " ".join(selected).strip() or text
+    if len(compact) > max_chars:
+        compact = compact[:max_chars].rsplit(" ", 1)[0].strip()
+    return compact
+
+
 def _voice_tts_chunks(text: str, max_words: int = 12) -> tuple[list[str], int]:
     raw = str(text or "").strip()
     sentences = _split_sentences(raw)
@@ -327,7 +391,7 @@ from backend.notify import (
 from backend.barge_in import BargeInController
 from backend.fast_voice_router import FastVoiceRouter
 from backend.latency_logger import VoiceLatencyLogger
-from backend.llm_streamer import build_voice_llm
+from backend.llm_streamer import build_voice_llm, groq_cooldown_active, groq_cooldown_remaining
 from backend.sarvam_streaming_stt import build_sarvam_stt
 from backend.sarvam_streaming_tts import build_sarvam_tts
 
@@ -545,7 +609,7 @@ class OutboundAssistant(Agent):
         self.conversation_ended = False
         self.greeting_sent = False
         self._last_committed_user_norm = ""
-        self._fallback_used_stages: set[str] = set()
+        self._natural_reply_pending_turn_id: int | None = None
         self._high_confidence_intents_used: set[str] = set()
         live_config_loaded = self._live_config
         self._response_timeout_s = float(live_config_loaded.get("response_timeout_seconds") or 1.2)
@@ -559,20 +623,58 @@ class OutboundAssistant(Agent):
         self._barge_in = BargeInController()
         self._voice_latency = VoiceLatencyLogger(call_id=str(live_config_loaded.get("call_id") or ""))
 
-        base_instructions = live_config_loaded.get("agent_instructions", "")
-        latency_mode = str(live_config_loaded.get("response_latency_mode") or "normal").lower()
-        ist_context = get_compact_ist_time_context() if latency_mode == "fast" else get_ist_time_context()
+        original_instructions = live_config_loaded.get("agent_instructions", "")
+        base_instructions = live_config_loaded.get("compact_agent_prompt") or _compact_agent_prompt(str(original_instructions or ""))
+        ist_context = get_compact_ist_time_context()
         lang_preset = live_config_loaded.get("lang_preset", "multilingual")
         lang_instruction = get_language_instruction(lang_preset)
+        prompt_hash = _prompt_hash(str(original_instructions or base_instructions or ""))
+        compact_prompt_hash = _prompt_hash(str(base_instructions or ""))
+        vertical = str(live_config_loaded.get("vertical") or "").strip() or "-"
+        language_profile = _language_profile_from_config(live_config_loaded)
+        welcome_message = str(
+            live_config_loaded.get("first_line")
+            or live_config_loaded.get("welcome_message")
+            or live_config_loaded.get("welcomeMessage")
+            or self._first_line
+            or ""
+        ).strip()
+        runtime_context = (
+            "\n\n[RUNTIME]\n"
+            f"Welcome: {welcome_message or '-'}\n"
+            f"Language: {language_profile}\n"
+            f"Vertical: {vertical}\n"
+            "Use the compact Agent Prompt as primary behavior."
+        )
         cost_guardrail = (
             "\n\n[VOICE STYLE]\n"
-            "Reply naturally in short Chennai Tanglish. "
-            "Use warm acknowledgements before one useful follow-up. "
-            "Do not sound like a rigid form or stage machine. "
-            "Ask one question at a time. Do not repeat the same question twice. "
-            "If the caller says hello/not clear/speak properly/I don't understand/puriyala, apologize briefly, switch simpler English/Tanglish, and continue."
+            "One short natural sentence only. Always keep replies under 15 words. "
+            "Ask one useful question at a time. No fallback templates. "
+            "Prefer Chennai Tanglish for Tamil callers."
         )
-        final_instructions = base_instructions + ist_context + lang_instruction + cost_guardrail
+        final_instructions = (
+            "[COMPACT AGENT PROMPT]\n"
+            + str(base_instructions or "").strip()
+            + runtime_context
+            + ist_context
+            + lang_instruction
+            + cost_guardrail
+        )
+        self._runtime_instructions = final_instructions
+        logger.info(
+            "[LLM_SYSTEM_PROMPT_ACTIVE] prompt_hash=%s prompt_length=%s language=%s vertical=%s",
+            prompt_hash or "-",
+            len(str(base_instructions or "")),
+            language_profile,
+            vertical,
+        )
+        logger.info(
+            "[LLM_COMPACT_PROMPT_ACTIVE] prompt_hash=%s compact_prompt_hash=%s original_length=%s compact_length=%s",
+            prompt_hash or "-",
+            compact_prompt_hash or "-",
+            len(str(original_instructions or "")),
+            len(str(base_instructions or "")),
+        )
 
         # Token counter (#11)
         token_count = count_tokens(final_instructions)
@@ -608,29 +710,40 @@ class OutboundAssistant(Agent):
             self.current_turn_id += 1
             self.response_sent_for_turn = False
             self.is_waiting_for_user = False
+            self._natural_reply_pending_turn_id = None
             self._last_committed_user_norm = norm
             logger.info("[TURN_UNLOCKED] turn_id=%s transcript=%s", self.current_turn_id, str(text or "")[:120])
         return self.current_turn_id
 
     def _can_send_for_current_turn(self, *, source: str) -> bool:
+        if source == "livekit_natural_tts" and self._natural_reply_pending_turn_id == self.current_turn_id:
+            return True
         if self.conversation_ended:
             logger.info("[MULTI_REPLY_BLOCKED] turn_id=%s source=%s reason=conversation_ended", self.current_turn_id, source)
+            logger.info("[DUPLICATE_BLOCKED] turn_id=%s source=%s reason=conversation_ended", self.current_turn_id, source)
             return False
         if self.response_sent_for_turn:
             logger.info("[MULTI_REPLY_BLOCKED] turn_id=%s source=%s reason=response_already_sent", self.current_turn_id, source)
+            logger.info("[DUPLICATE_BLOCKED] turn_id=%s source=%s reason=response_already_sent", self.current_turn_id, source)
             return False
         if self.is_waiting_for_user:
             logger.info("[MULTI_REPLY_BLOCKED] turn_id=%s source=%s reason=waiting_for_user", self.current_turn_id, source)
+            logger.info("[DUPLICATE_BLOCKED] turn_id=%s source=%s reason=waiting_for_user", self.current_turn_id, source)
             return False
         return True
 
     def _mark_response_sent(self, *, source: str) -> None:
         self.response_sent_for_turn = True
         self.is_waiting_for_user = True
+        if source == "livekit_natural_tts":
+            self._natural_reply_pending_turn_id = None
         logger.info("[TURN_SENT] turn_id=%s source=%s", self.current_turn_id, source)
         logger.info("[WAITING_FOR_USER] turn_id=%s", self.current_turn_id)
 
     def note_external_assistant_response(self, *, source: str = "external_assistant") -> None:
+        if source == "conversation_item_added":
+            logger.info("[LIVEKIT_GROQ_MAIN_BRAIN] turn_id=%s source=conversation_item_added lock_deferred_to_tts", self.current_turn_id)
+            return
         if self.response_sent_for_turn:
             return
         self._mark_response_sent(source=source)
@@ -644,13 +757,56 @@ class OutboundAssistant(Agent):
         self._high_confidence_intents_used.add(intent)
         return False
 
-    def _fallback_allowed_for_stage(self) -> bool:
-        stage = str(self._fast_router.state.stage or "unknown")
-        if stage in self._fallback_used_stages:
-            logger.info("[FALLBACK_SKIPPED_ALREADY_USED] stage=%s turn_id=%s", stage, self.current_turn_id)
+    def _local_cooldown_reply(self, user_text: str) -> str:
+        low = _normalize_voice_text(user_text)
+        if _is_exit_intent(low):
+            return "Okay sir, thanks, call cut pannuren."
+        if re.search(r"\b(hello+|helo+|hallo+|hi|hey)\b", low):
+            return "Hello sir."
+        if re.search(r"\b(repeat|again|once more|innoru thadava|marubadi|thirumba)\b", low):
+            last = _limit_voice_words(self._fast_router.state.last_agent_text or self._last_assistant_norm, max_words=12)
+            return last or "Sorry sir, one more time sollunga."
+        if _is_confused_user(low) or re.search(r"\b(not clear|speak properly|clear ah illa|puriyala|theriyala)\b", low):
+            return "Sorry sir, konjam clear-ah sollunga."
+        return "Sorry sir, system busy. Please repeat shortly."
+
+    async def _handle_groq_cooldown_turn(self, user_text: str) -> bool:
+        if not groq_cooldown_active():
             return False
-        self._fallback_used_stages.add(stage)
+        remaining = groq_cooldown_remaining()
+        logger.warning("[GROQ_COOLDOWN_ACTIVE] turn_id=%s remaining_seconds=%s", self.current_turn_id, remaining)
+        reply = self._local_cooldown_reply(user_text)
+        logger.info("[LOCAL_REPLY_USED] turn_id=%s reason=groq_cooldown text=%s", self.current_turn_id, reply[:80])
+        await self._say_guarded(reply, allow_interruptions=True, wait=True, lifecycle="groq_cooldown")
+        if _is_exit_intent(user_text):
+            self.conversation_ended = True
         return True
+
+    async def _call_livekit_natural_reply(self, *, reason: str, turn_ctx: llm.ChatContext | None = None, user_text: str = "") -> None:
+        if self.conversation_ended:
+            raise StopResponse()
+        if await self._handle_groq_cooldown_turn(user_text):
+            raise StopResponse()
+        logger.info("[CONTROLLER_NO_OVERRIDE] turn_id=%s reason=%s", self.current_turn_id, reason)
+        logger.info("[LIVEKIT_GROQ_MAIN_BRAIN] turn_id=%s reason=%s", self.current_turn_id, reason)
+        logger.info("[LIVEKIT_NATURAL_REPLY_CALLED] turn_id=%s reason=%s", self.current_turn_id, reason)
+        try:
+            self.response_sent_for_turn = True
+            self.is_waiting_for_user = True
+            self._natural_reply_pending_turn_id = self.current_turn_id
+            kwargs: dict[str, Any] = {
+                "instructions": self._runtime_instructions,
+                "allow_interruptions": True,
+            }
+            if turn_ctx is not None:
+                kwargs["chat_ctx"] = turn_ctx
+            self.session.generate_reply(**kwargs)
+        except Exception as e:
+            self.response_sent_for_turn = False
+            self.is_waiting_for_user = False
+            self._natural_reply_pending_turn_id = None
+            logger.exception("[LIVEKIT_NATURAL_REPLY_FAILED] turn_id=%s reason=%s exception=%s", self.current_turn_id, reason, e)
+            raise
 
     async def _say_guarded(
         self,
@@ -832,11 +988,13 @@ class OutboundAssistant(Agent):
         if not text:
             return
         self.begin_committed_user_turn(text)
-        logger.info("[CONTROLLER_GUARD_ONLY] turn_id=%s", self.current_turn_id)
+        logger.info("[SAFETY_ONLY_CONTROLLER] turn_id=%s", self.current_turn_id)
+        logger.info("[LIVEKIT_GROQ_MAIN_BRAIN] turn_id=%s", self.current_turn_id)
         if self.conversation_ended:
             raise StopResponse()
         if self.response_sent_for_turn or self.is_waiting_for_user:
             logger.info("[MULTI_REPLY_BLOCKED] turn_id=%s source=on_user_turn_completed reason=locked_before_routing", self.current_turn_id)
+            logger.info("[DUPLICATE_BLOCKED] turn_id=%s source=on_user_turn_completed reason=locked_before_routing", self.current_turn_id)
             raise StopResponse()
         if _is_exit_intent(text):
             logger.info("[EXIT_DETECTED] turn_id=%s text=%s", self.current_turn_id, text[:120])
@@ -845,27 +1003,26 @@ class OutboundAssistant(Agent):
             raise StopResponse()
         if _is_soft_ack(text):
             logger.info("[SOFT_ACK_DETECTED] turn_id=%s text=%s", self.current_turn_id, text[:120])
-            self.is_waiting_for_user = True
-            logger.info("[WAITING_FOR_USER] turn_id=%s source=soft_ack_silent", self.current_turn_id)
+            await self._call_livekit_natural_reply(reason="soft_ack", turn_ctx=turn_ctx, user_text=text)
             raise StopResponse()
         if self._fast_pipeline_enabled:
             self._fast_router.start_turn()
             fast_action = self._fast_router.route_final(text)
             if fast_action.handled and fast_action.message and fast_action.confidence >= 0.9:
                 if self._is_repeated_high_confidence_intro(fast_action.intent or ""):
-                    self.is_waiting_for_user = True
-                    logger.info("[WAITING_FOR_USER] turn_id=%s source=repeated_high_confidence_intro", self.current_turn_id)
+                    await self._call_livekit_natural_reply(reason="repeated_fast_router_intro", turn_ctx=turn_ctx, user_text=text)
                     raise StopResponse()
-                logger.info("[FAST_PIPELINE] llm_skipped intent=%s stage=%s", fast_action.intent, fast_action.stage)
+                logger.info("[FAST_PIPELINE] emergency_override intent=%s stage=%s", fast_action.intent, fast_action.stage)
                 logger.info("[FAST_ROUTER_HIGH_CONFIDENCE] turn_id=%s intent=%s confidence=%s", self.current_turn_id, fast_action.intent or "-", fast_action.confidence)
-                logger.info("[CONTROLLER_OWNED_REPLY] turn_id=%s source=fast_router intent=%s", self.current_turn_id, fast_action.intent or "-")
-                logger.info("[LIVEKIT_REPLY_SKIPPED_HIGH_CONFIDENCE] turn_id=%s intent=%s", self.current_turn_id, fast_action.intent or "-")
+                logger.info("[SAFETY_ONLY_CONTROLLER] turn_id=%s emergency_reply=true source=fast_router intent=%s", self.current_turn_id, fast_action.intent or "-")
                 self._voice_latency.log(
                     stage=self._fast_router.state.stage,
                     stt_partial_ms=self._fast_router.last_partial_ms,
                     router_ms=self._fast_router.last_router_ms,
                 )
                 await self._say_guarded(fast_action.message, allow_interruptions=True, lifecycle="fast_router")
+                if (fast_action.intent or "") in {"cut_call", "wrong_number"}:
+                    self.conversation_ended = True
                 raise StopResponse()
             logger.info(
                 "[FAST_ROUTER_LOW_CONFIDENCE_SKIPPED] turn_id=%s intent=%s confidence=%s handled=%s",
@@ -874,16 +1031,14 @@ class OutboundAssistant(Agent):
                 fast_action.confidence,
                 fast_action.handled,
             )
-            logger.info("[LIVEKIT_NATURAL_REPLY_ALLOWED] turn_id=%s reason=normal_conversation", self.current_turn_id)
-            return
+            await self._call_livekit_natural_reply(reason="fast_router_no_emergency", turn_ctx=turn_ctx, user_text=text)
+            raise StopResponse()
         if _is_confused_user(text):
             logger.info("[CONFUSION_DETECTED] text=%s", text[:120])
-            if self._fallback_allowed_for_stage():
-                logger.info("[CONTROLLER_OWNED_REPLY] turn_id=%s source=confusion_fallback", self.current_turn_id)
-                await self._say_guarded(self._fallback_recovery_line(text), allow_interruptions=True, lifecycle="confusion_fallback")
+            await self._call_livekit_natural_reply(reason="confusion_natural_reply", turn_ctx=turn_ctx, user_text=text)
             raise StopResponse()
-        logger.info("[LIVEKIT_NATURAL_REPLY_ALLOWED] turn_id=%s reason=controller_guard_only", self.current_turn_id)
-        return
+        await self._call_livekit_natural_reply(reason="safety_clear", turn_ctx=turn_ctx, user_text=text)
+        raise StopResponse()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -993,6 +1148,15 @@ class CallLatencyTracker:
             logger.info("[LLM_FIRST_TOKEN_MS] room=%s turn=%s ms=%s speech_id=%s", self.room_name, turn_id, first_ms, getattr(metric, "speech_id", None) or "")
             self._voice_latency.log(stage="llm", llm_first_token_ms=first_ms)
             logger.info("[LLM_TOTAL_MS] room=%s turn=%s ms=%s tokens=%s", self.room_name, turn_id, total_ms, getattr(metric, "total_tokens", 0))
+            logger.info(
+                "[LLM_REPLY_TOKENS] room=%s turn=%s prompt_tokens=%s completion_tokens=%s total_tokens=%s cached_tokens=%s",
+                self.room_name,
+                turn_id,
+                getattr(metric, "prompt_tokens", 0),
+                getattr(metric, "completion_tokens", 0),
+                getattr(metric, "total_tokens", 0),
+                getattr(metric, "prompt_cached_tokens", 0),
+            )
             return
         if mtype == "tts_metrics":
             first_ms = int(float(getattr(metric, "ttfb", 0.0) or 0.0) * 1000)
@@ -1152,6 +1316,23 @@ async def entrypoint(ctx: JobContext):
     if not str(live_config.get("first_line") or "").strip():
         live_config["first_line"] = FALLBACK_FIRST_LINE
         logger.warning("[FIRST_LINE_FALLBACK] agent_id=%s", metadata_agent_id or "-")
+    loaded_prompt = _normalize_runtime_prompt_config(live_config)
+    _loaded_agent_id = str(
+        live_config.get("agent_id")
+        or metadata_agent_id
+        or metadata_published_agent_uuid
+        or metadata_agent_config.get("agent_id")
+        or ""
+    ).strip() or "-"
+    if loaded_prompt:
+        logger.info(
+            "[AGENT_PROMPT_LOADED] agent_id=%s prompt_length=%s first_100_chars=%s",
+            _loaded_agent_id,
+            len(loaded_prompt),
+            re.sub(r"\s+", " ", loaded_prompt)[:100],
+        )
+    else:
+        logger.warning("[AGENT_PROMPT_MISSING] agent_id=%s", _loaded_agent_id)
 
     engine_cfg = live_config.get("engine_config") if isinstance(live_config.get("engine_config"), dict) else {}
     vertical = str(live_config.get("vertical") or engine_cfg.get("vertical") or "").strip()
@@ -1165,7 +1346,7 @@ async def entrypoint(ctx: JobContext):
         live_config["llm_temperature"] = float(live_config.get("llm_temperature") or 0.2)
         if str(live_config.get("llm_provider") or "").lower() == "groq" and str(live_config.get("llm_model") or "").strip() in {"", "llama-3.3-70b-versatile"}:
             live_config["llm_model"] = "llama-3.1-8b-instant"
-        live_config["llm_max_tokens"] = min(int(live_config.get("llm_max_tokens") or 36), 36)
+        live_config["llm_max_tokens"] = 40
         logger.info(
             "[LATENCY_OPTIMIZED_CONFIG] vertical=tamil_real_estate saved_mode=%s mode=fast stt_endpointing=%s max_turns=8 silence_reference=6 llm_model=%s",
             latency_mode or "-",
@@ -1193,8 +1374,8 @@ async def entrypoint(ctx: JobContext):
         logger.info("[ANALYTICS_CONFIG] loaded %s", json.dumps(analytics_cfg, default=str)[:800])
 
     delay_setting = live_config.get("stt_min_endpointing_delay", 0.05)
-    llm_model     = live_config.get("llm_model", "gpt-4o-mini")
-    llm_provider  = str(live_config.get("llm_provider", "openai") or "openai").lower()
+    llm_model     = live_config.get("llm_model", "llama-3.1-8b-instant")
+    llm_provider  = str(live_config.get("llm_provider", "groq") or "groq").lower()
     tts_voice     = live_config.get("tts_voice", "kavya")
     tts_language  = live_config.get("tts_language", "en-IN")
     tts_provider  = str(live_config.get("tts_provider", "sarvam") or "sarvam").lower()
@@ -1208,13 +1389,13 @@ async def entrypoint(ctx: JobContext):
     env_groq_key = str(os.getenv("GROQ_API_KEY") or "").strip()
     openai_ready = not _looks_placeholder_secret(live_openai_key or env_openai_key)
     groq_ready = not _looks_placeholder_secret(live_groq_key or env_groq_key)
-    if llm_provider == "openai" and not openai_ready and groq_ready:
+    if groq_ready:
         llm_provider = "groq"
         live_config["llm_provider"] = "groq"
         if not str(live_config.get("llm_model") or "").strip() or str(live_config.get("llm_model")).startswith("gpt-"):
             live_config["llm_model"] = "llama-3.1-8b-instant"
             llm_model = live_config["llm_model"]
-        logger.warning("[LLM_PROVIDER_FALLBACK] from=openai to=groq reason=openai_key_missing_or_placeholder")
+        logger.info("[LLM_CONFIG] groq_primary=true model=%s", llm_model)
     if stt_provider == "deepgram" and not os.getenv("DEEPGRAM_API_KEY", "").strip():
         logger.warning("[STT] Deepgram selected but DEEPGRAM_API_KEY is not set — falling back to Sarvam")
         stt_provider = "sarvam"
@@ -1294,6 +1475,16 @@ async def entrypoint(ctx: JobContext):
         logger.info(f"[MEMORY] Loaded caller history for {caller_phone}")
         # Append to live_config instructions
         live_config["agent_instructions"] = (live_config.get("agent_instructions","") + caller_history)
+
+    compact_prompt = _compact_agent_prompt(str(live_config.get("agent_instructions") or ""))
+    live_config["compact_agent_prompt"] = compact_prompt
+    logger.info(
+        "[LLM_COMPACT_PROMPT_CACHED] original_length=%s compact_length=%s prompt_hash=%s compact_prompt_hash=%s",
+        len(str(live_config.get("agent_instructions") or "")),
+        len(compact_prompt),
+        _prompt_hash(str(live_config.get("agent_instructions") or "")) or "-",
+        _prompt_hash(compact_prompt) or "-",
+    )
 
     # ── Instantiate tools ─────────────────────────────────────────────────
     agent_tools = AgentTools(caller_phone=caller_phone, caller_name=caller_name, live_config=live_config)
@@ -1435,18 +1626,24 @@ async def entrypoint(ctx: JobContext):
         return
 
     # ── Build LLM (#8 Groq support) ───────────────────────────────────────
-    llm_max_tokens = int(live_config.get("llm_max_tokens") or os.getenv("VOICE_MAX_COMPLETION_TOKENS", "64") or 64)
+    llm_max_tokens = 40
     llm_temperature = float(live_config.get("llm_temperature") or 0.3)
-    _latency_mode = str(live_config.get("response_latency_mode") or "normal").lower()
-    if _latency_mode == "fast":
-        llm_max_tokens = min(llm_max_tokens, 36)
-    elif _latency_mode == "quality":
-        llm_max_tokens = max(llm_max_tokens, 96)
+    live_config["llm_max_tokens"] = llm_max_tokens
+    openai_fallback_enabled = str(os.getenv("OPENAI_FALLBACK_ENABLED") or "").strip().lower() == "true"
     agent_llm = build_voice_llm(
         provider=llm_provider,
         model=llm_model,
         max_completion_tokens=llm_max_tokens,
         temperature=llm_temperature,
+        fallback_provider="openai" if (openai_ready and openai_fallback_enabled) else None,
+        fallback_model=str(live_config.get("llm_fallback_model") or os.getenv("VOICE_LLM_FALLBACK_MODEL") or "gpt-4o-mini"),
+    )
+    logger.info(
+        "[LLM_CONFIG] provider=%s model=%s max_completion_tokens=%s fallback_provider=%s",
+        llm_provider,
+        llm_model,
+        llm_max_tokens,
+        "openai" if (openai_ready and openai_fallback_enabled) else "-",
     )
 
     # ── Build STT (#1 16kHz, #20 auto-detect, #9 Deepgram) ──────────────

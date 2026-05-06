@@ -10,6 +10,8 @@ alter table public.call_logs add column if not exists next_retry_at timestamptz;
 alter table public.call_logs add column if not exists failure_reason text not null default '';
 alter table public.call_logs add column if not exists room_name text not null default '';
 alter table public.call_logs add column if not exists agent_id text;
+alter table public.call_logs add column if not exists phone_number text;
+alter table public.call_logs add column if not exists started_at timestamptz;
 
 do $$
 begin

@@ -34,6 +34,7 @@ logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 load_dotenv()
 logger = logging.getLogger("outbound-agent")
+FALLBACK_FIRST_LINE = "ஹலோ sir, MAXR Consultancy ல இருந்து பேசுறேன். Chennai la property பார்க்கிறீங்களா?"
 logging.basicConfig(level=logging.INFO)
 _PROCESS_STARTED_MONO = time.perf_counter()
 _FIRST_LIVEKIT_JOB_SEEN = False
@@ -557,7 +558,14 @@ class OutboundAssistant(Agent):
             self._recent_question_norms = (self._recent_question_norms + [norm])[-5:]
         return cleaned
 
-    async def _say_guarded(self, line: str, *, allow_interruptions: bool = True, wait: bool = False) -> None:
+    async def _say_guarded(
+        self,
+        line: str,
+        *,
+        allow_interruptions: bool = True,
+        wait: bool = False,
+        lifecycle: str = "",
+    ) -> None:
         text = _sanitize_tts_text(self._dedupe_reply(line))
         if not text:
             logger.info("[TTS_CHUNK_SKIPPED] reason=no_speakable_text")
@@ -565,6 +573,8 @@ class OutboundAssistant(Agent):
         speak_start = time.perf_counter()
         handle = self.session.say(text, allow_interruptions=allow_interruptions)
         publish_ms = _ms_since(speak_start)
+        if lifecycle == "greeting":
+            logger.info("[FIRST_AUDIO_SENT] stage=greeting publish_ms=%s chars=%s", publish_ms, len(text))
         logger.info("[VOICE_LATENCY] stage=%s livekit_publish_ms=%s chars=%s", self._fast_router.state.stage, publish_ms, len(text))
         self._voice_latency.log(stage=self._fast_router.state.stage, livekit_publish_ms=publish_ms)
         self._fast_router.mark_agent_reply(text)
@@ -580,16 +590,23 @@ class OutboundAssistant(Agent):
             self._barge_in.interrupt(self.session, self._active_response_task, reason=f"early_intent:{result.intent}")
 
     async def on_enter(self):
-        greeting = self._live_config.get(
-            "first_line",
-            self._first_line or (
-                "Namaste! This is Jettone calling. How can I help you today?"
+        greeting = self._live_config.get("first_line") or self._first_line or FALLBACK_FIRST_LINE
+        try:
+            logger.info(
+                "[GREETING_TRIGGERED] agent_id=%s first_line=%s",
+                str(self._live_config.get("agent_id") or "").strip() or "-",
+                str(greeting or "").strip(),
             )
-        )
-        greeting_chunks, _raw_sentence_count = _voice_tts_chunks(greeting, max_words=12)
-        greeting = greeting_chunks[0] if greeting_chunks else greeting
-        logger.info("[WELCOME_TTS_START] chars=%s direct_tts=true", len(greeting or ""))
-        await self._say_guarded(greeting, allow_interruptions=True, wait=True)
+            greeting_chunks, _raw_sentence_count = _voice_tts_chunks(greeting, max_words=12)
+            greeting = greeting_chunks[0] if greeting_chunks else greeting
+            if not str(greeting or "").strip():
+                greeting = FALLBACK_FIRST_LINE
+            logger.info("[GREETING_TTS_STARTED] chars=%s direct_tts=true", len(greeting or ""))
+            logger.info("[WELCOME_TTS_START] chars=%s direct_tts=true", len(greeting or ""))
+            await self._say_guarded(greeting, allow_interruptions=True, wait=True, lifecycle="greeting")
+        except Exception as e:
+            logger.exception("[GREETING_FAILED] exception=%s first_line=%s", e, str(greeting or "").strip())
+            raise
 
     def tts_node(self, text: AsyncIterable[str], model_settings: Any) -> Any:
         async def _short_chunk_stream():
@@ -1060,6 +1077,9 @@ async def entrypoint(ctx: JobContext):
     if metadata_first_line:
         live_config["first_line"] = metadata_first_line
         logger.info("[DISPATCH] Using first_line from dispatch metadata")
+    if not str(live_config.get("first_line") or "").strip():
+        live_config["first_line"] = FALLBACK_FIRST_LINE
+        logger.warning("[FIRST_LINE_FALLBACK] agent_id=%s", metadata_agent_id or "-")
 
     engine_cfg = live_config.get("engine_config") if isinstance(live_config.get("engine_config"), dict) else {}
     vertical = str(live_config.get("vertical") or engine_cfg.get("vertical") or "").strip()
@@ -1129,6 +1149,15 @@ async def entrypoint(ctx: JobContext):
         stt_model = ""
     if not stt_model:
         stt_model = "nova-2-general" if stt_provider == "deepgram" else "saaras:v3"
+    logger.info(
+        "[AGENT_CONFIG_LOADED] agent_id=%s first_line=%s voice_pipeline=%s stt_provider=%s tts_provider=%s llm_provider=%s",
+        str(live_config.get("agent_id") or metadata_agent_id or metadata_published_agent_uuid or "").strip() or "-",
+        str(live_config.get("first_line") or "").strip(),
+        str(live_config.get("voice_pipeline") or os.getenv("VOICE_PIPELINE") or "livekit_agents").strip(),
+        stt_provider,
+        tts_provider,
+        llm_provider,
+    )
 
     logger.info(
         "[AUDIO_CONFIG] loaded agent_id=%s version_id=%s tts_provider=%s tts_model=%s tts_voice=%s tts_language=%s "

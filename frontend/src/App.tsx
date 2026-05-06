@@ -353,6 +353,7 @@ type DemoAgent = {
   sttProvider?: string;
   sttModel?: string;
   sttLanguage?: string;
+  voicePipeline?: string;
   /** Persisted agent row config (merge on save) */
   configSnapshot?: Record<string, unknown>;
   /** STT endpointing delay in seconds (engine_config) */
@@ -568,6 +569,20 @@ function validateAgentForSave(agent: DemoAgent, deepgramConfigured: boolean | un
   return null;
 }
 
+function validateAgentForPublish(agent: DemoAgent, deepgramConfigured: boolean | undefined): string | null {
+  if (!(agent.welcomeMessage || '').trim()) return 'Welcome message is required before publishing.';
+  if (!(agent.prompt || '').trim()) return 'Agent prompt is required before publishing.';
+  const audioErr = validateAgentForSave(agent, deepgramConfigured);
+  if (audioErr) return audioErr;
+  if (!(agent.ttsProvider || '').trim() || !(agent.sttProvider || '').trim()) {
+    return 'Voice config is required before publishing.';
+  }
+  if (!(agent.llmProvider || '').trim() || !(agent.voicePipeline || 'livekit_agents').trim()) {
+    return 'Pipeline config is required before publishing.';
+  }
+  return null;
+}
+
 function mapAgentRow(row: AgentRow, index = 0): DemoAgent {
   const version = row.active_version;
   const llmConfig = version?.llm_config;
@@ -612,6 +627,7 @@ function mapAgentRow(row: AgentRow, index = 0): DemoAgent {
     sttProvider: configString(audioConfig, 'stt_provider', 'sarvam'),
     sttModel: configString(audioConfig, 'stt_model', DEFAULT_STT_MODEL_SARVAM),
     sttLanguage: configString(audioConfig, 'stt_language', 'unknown'),
+    voicePipeline: configString(rowConfig, 'voice_pipeline', configString(engineConfig, 'voice_pipeline', 'livekit_agents')),
     agentTone: configString(engineConfig, 'agent_tone', ''),
     businessType: configString(engineConfig, 'business_type', ''),
     vertical: configString(engineConfig, 'vertical', ''),
@@ -649,6 +665,7 @@ function agentConfigPayload(agent: DemoAgent): Record<string, unknown> {
     phone: agent.phone,
     inbound_number_id: (agent.inboundNumberId || '').trim(),
     inbound_assign_enabled: agent.inboundAssignEnabled ?? false,
+    voice_pipeline: agent.voicePipeline || 'livekit_agents',
   };
 }
 
@@ -700,6 +717,7 @@ function versionPayload(agent: DemoAgent) {
       silence_timeout_seconds: silenceEngineV,
       interruption_words: serializeInterruptionWords(agent.interruptionWords || ''),
       response_latency_mode: agent.responseLatencyMode || 'normal',
+      voice_pipeline: agent.voicePipeline || 'livekit_agents',
     },
     call_config: {
       final_call_message: agent.finalCallMessage || '',
@@ -916,7 +934,7 @@ function Agents() {
         const mapped = mapAgentRow(created);
         setAgents((current) => [mapped, ...current.filter((agent) => agent.id !== selected.id)]);
         setSelectedId(mapped.id);
-        setFormStatus({ tone: 'success', message: 'Agent saved as a DB draft. Publish it before using it for calls.' });
+        setFormStatus({ tone: 'info', message: 'Saved but not published. Changes are not live until you click Publish.' });
         return;
       }
       await api.updateAgent(selected.id, {
@@ -928,11 +946,11 @@ function Agents() {
       if (!selected.versionId || selected.versionStatus === 'published') {
         await api.createAgentVersion(selected.id, versionPayload(selected));
         await refreshAgent(selected.id);
-        setFormStatus({ tone: 'success', message: 'Saved as a new draft version. Publish this draft before calling.' });
+        setFormStatus({ tone: 'info', message: 'Saved but not published. Changes are not live until you click Publish.' });
       } else {
         await api.updateAgentVersion(selected.id, selected.versionId, versionPayload(selected));
         await refreshAgent(selected.id);
-        setFormStatus({ tone: 'success', message: 'Draft agent saved.' });
+        setFormStatus({ tone: 'info', message: 'Saved but not published. Changes are not live until you click Publish.' });
       }
     } catch (error: unknown) {
       setFormStatus({ tone: 'error', message: getErrorMessage(error, 'Agent save failed.') });
@@ -941,9 +959,9 @@ function Agents() {
     }
   };
   const publishAgent = async () => {
-    const audioErr = validateAgentForSave(selected, providerOpts?.deepgram_configured);
-    if (audioErr) {
-      setFormStatus({ tone: 'error', message: audioErr });
+    const publishErr = validateAgentForPublish(selected, providerOpts?.deepgram_configured);
+    if (publishErr) {
+      setFormStatus({ tone: 'error', message: publishErr });
       return;
     }
     setPublishing(true);
@@ -988,7 +1006,7 @@ function Agents() {
       const mapped = mapAgentRow(result.agent);
       setAgents((current) => current.map((item) => (item.id === mapped.id || item.id === selected.id ? mapped : item)));
       setSelectedId(mapped.id);
-      setFormStatus({ tone: 'success', message: `Published. Use UUID ${mapped.publishedAgentUuid || 'pending'} for call tests.` });
+      setFormStatus({ tone: 'success', message: `Published. Live calls now use this prompt and welcome message. UUID ${mapped.publishedAgentUuid || 'pending'}.` });
     } catch (error: unknown) {
       setFormStatus({ tone: 'error', message: getErrorMessage(error, 'Agent publish failed.') });
     } finally {
@@ -1209,6 +1227,11 @@ function Agents() {
               <p className="break-all"><span className="font-semibold text-slate-500">Published agent UUID:</span> {selected.publishedAgentUuid || 'Publish to generate call-ready UUID'}</p>
               <p className="break-all"><span className="font-semibold text-slate-500">agent_version_id:</span> {selected.versionId || '-'}</p>
             </div>
+            {(!selectedIsPublished || selected.dirty) && (
+              <div className="mt-4 rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-800">
+                Changes are not live until you click Publish.
+              </div>
+            )}
             {formStatus && (
               <div className={`mt-4 rounded-md border px-3 py-2 text-sm ${
                 formStatus.tone === 'success'

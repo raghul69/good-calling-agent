@@ -1,25 +1,16 @@
-import { defineConfig } from 'vitest/config'
-import react from '@vitejs/plugin-react'
+/// <reference types="vitest/config" />
+import { defineConfig } from "vite";
+import react from "@vitejs/plugin-react";
 
-// https://vite.dev/config/
+// Expose both VITE_* (Vite default) and NEXT_PUBLIC_* (Vercel dashboard naming) to the client.
 export default defineConfig({
   plugins: [react()],
-  envPrefix: ['VITE_', 'NEXT_PUBLIC_'],
-  build: {
-    chunkSizeWarningLimit: 2000,
-  },
+  envPrefix: ["VITE_", "NEXT_PUBLIC_"],
   test: {
-    environment: 'jsdom',
-    setupFiles: './src/test/setup.ts',
-    globals: true,
+    environment: "jsdom",
+    setupFiles: ["./src/test/setup.ts"],
+    pool: "threads",
+    maxWorkers: 1,
+    fileParallelism: false,
   },
-  server: {
-    port: 3000,
-    proxy: {
-      '/api': {
-        target: process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000',
-        changeOrigin: true,
-      }
-    }
-  }
-})
+});

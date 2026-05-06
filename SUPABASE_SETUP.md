@@ -1,84 +1,81 @@
 # Supabase Setup
 
-Use this for production and local demo.
+Keep `SUPABASE_SERVICE_ROLE_KEY` server-side only. Put it in `.env` locally and Railway environment variables in production.
 
-## 1. Project Keys
+## Required Railway Variables
 
-In Supabase, open Project Settings -> API and copy:
+- `SUPABASE_URL`
+- `SUPABASE_KEY`
+- `SUPABASE_ANON_KEY`
+- `SUPABASE_SERVICE_ROLE_KEY`
+- `SUPABASE_S3_ACCESS_KEY`
+- `SUPABASE_S3_SECRET_KEY`
+- `SUPABASE_S3_ENDPOINT`
+- `SUPABASE_S3_REGION`
 
-- Project URL -> `SUPABASE_URL`
-- anon public key -> `SUPABASE_KEY`
-- service_role secret key -> `SUPABASE_SERVICE_ROLE_KEY`
+## Migrations
 
-Keep `SUPABASE_SERVICE_ROLE_KEY` server-side only. Put it in `.env` locally and Render environment variables in production.
+Run these in the Supabase SQL Editor:
 
-## 2. Database
+1. `supabase_migration_v2.sql`
+2. `supabase_migration_saas_workspaces.sql`
+3. `supabase_migration_production_hardening.sql`
+4. `supabase_migration_agent_foundation.sql`
 
-Open SQL Editor -> New Query.
+The agent foundation migration adds workspace-scoped agents, immutable agent versions, provider routes, provider usage events, audit logs, and `call_logs.agent_version_id`.
 
-Paste and run:
+## Auth URLs (Vercel + Railway + local)
 
-```text
-supabase_migration_v2.sql
-```
-
-That migration creates:
-
-- `call_logs`
-- `active_calls`
-- `call_transcripts`
-- owner-based RLS policies using `auth.uid() = user_id`
-- private `call-recordings` bucket
-
-Do not use allow-all policies for SaaS production.
-
-## 3. Auth / OTP
-
-Open Authentication -> URL Configuration:
-
-- Site URL: `https://YOUR_RENDER_SERVICE.onrender.com`
-- Redirect URLs:
-  - `https://YOUR_RENDER_SERVICE.onrender.com/**`
-  - `http://127.0.0.1:8001/**`
-  - `http://localhost:8001/**`
-
-Open Authentication -> Providers -> Email:
-
-- Enable Email provider.
-- Enable email OTP / magic link.
-- Keep OTP rate limits at safe defaults.
-
-If Supabase says you can request an OTP only after a number of seconds, wait for the cooldown. That is rate limiting, not an app crash.
-
-## 4. Storage / Recordings
-
-Create S3 access keys from Storage -> Settings -> S3 Access.
-
-Set:
+Set **Site URL** to your deployed SPA (typically Vercel):
 
 ```text
-SUPABASE_S3_ACCESS_KEY=...
-SUPABASE_S3_SECRET_KEY=...
-SUPABASE_S3_ENDPOINT=https://YOUR_PROJECT_REF.supabase.co/storage/v1/s3
-SUPABASE_S3_REGION=ap-south-1
+https://YOUR_VERCEL_APP.vercel.app
 ```
 
-The migration keeps the bucket private. Recordings are stored under:
+Add **Redirect URLs** (include wildcards for hash / PKCE flows):
 
 ```text
-recordings/<user_id>/<room>.ogg
+https://YOUR_VERCEL_APP.vercel.app/**
+https://YOUR_RAILWAY_PUBLIC_HOST.up.railway.app/**
+http://localhost:3000/**
+http://127.0.0.1:3000/**
+http://localhost:5173/**
+http://127.0.0.1:5173/**
 ```
 
-## 5. Verify
+Railway remains the API source of truth (`NEXT_PUBLIC_API_URL` on Vercel).
 
-Run:
+## MVP: email/password without confirmation (testing)
 
-```sql
-select column_name, data_type
-from information_schema.columns
-where table_schema = 'public'
-  and table_name = 'call_logs'
-order by ordinal_position;
+In Supabase Dashboard → **Authentication → Providers → Email**:
+
+- Enable **Email** provider.
+- For quick MVP / internal testing: **disable “Confirm email”** (or equivalent) so password signup signs in immediately — re-enable confirmation before public launch.
+
+Continue to use **password** sign-in from the app (`Login.tsx`). OTP / magic link can stay available or be hidden in the UI; they are independent of this setting.
+
+## Production email verification (recommended before public launch)
+
+- Re-enable **Confirm email** for verified signup.
+- Optionally keep **Email OTP / Magic Link** for passwordless login.
+
+## Google OAuth
+
+In Supabase Dashboard → Authentication → Providers → Google:
+
+- Enable Google provider.
+- Add the Google OAuth Client ID and Client Secret.
+- In Google Cloud Console, add the Supabase callback URL shown in the Supabase Google provider settings.
+
+The frontend uses:
+
+```ts
+supabase.auth.signInWithOAuth({
+  provider: "google",
+  options: { redirectTo: "https://YOUR_FRONTEND_OR_RAILWAY_DOMAIN/agents" },
+});
 ```
 
-Confirm `user_id`, `phone`, `duration`, `summary`, and `recording_url` exist.
+## Production Rule
+
+Use Railway as the backend source of truth. Vercel should call Railway through `NEXT_PUBLIC_API_URL`.

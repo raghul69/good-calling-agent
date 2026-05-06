@@ -1,14 +1,6 @@
-import '@testing-library/jest-dom';
+import "@testing-library/jest-dom/vitest";
 
-// jsdom has no IntersectionObserver (browser does); stub for mount smoke tests.
-globalThis.IntersectionObserver = class IntersectionObserver {
-  readonly root: Element | null = null;
-  readonly rootMargin = "";
-  readonly thresholds: ReadonlyArray<number> = [];
-  observe(): void {}
-  unobserve(): void {}
-  disconnect(): void {}
-  takeRecords(): IntersectionObserverEntry[] {
-    return [];
-  }
-} as unknown as typeof IntersectionObserver;
+// Vitest/jsdom compatibility for browser-only deps (xterm initializes with `self`)
+if (typeof globalThis.self === "undefined") {
+  (globalThis as unknown as { self: typeof globalThis }).self = globalThis;
+}

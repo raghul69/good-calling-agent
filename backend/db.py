@@ -8,15 +8,18 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List
 from urllib.parse import urlparse
 
-from supabase import Client, create_client
+import httpx
+from supabase import Client, ClientOptions, create_client
 
 logger = logging.getLogger("backend-db")
+_SUPABASE_HTTP_CLIENT: httpx.Client | None = None
 
 RETRYABLE_CALL_FAILURES = {"no_answer", "busy", "sip_failure", "timeout"}
 MAX_CALL_RETRIES = int(os.getenv("MAX_CALL_RETRIES", "3") or 3)
 CALL_RETRY_DELAY_SECONDS = int(os.getenv("CALL_RETRY_DELAY_SECONDS", "300") or 300)
 
 DEFAULT_WELCOME_MESSAGE = "Hello, this is your AI assistant. Can you hear me?"
+FALLBACK_FIRST_LINE = "ஹலோ sir, MAXR Consultancy ல இருந்து பேசுறேன். Chennai la property பார்க்கிறீங்களா?"
 DEFAULT_SYSTEM_PROMPT = (
     "You are a warm, concise AI voice assistant. Keep every response short, "
     "ask one question at a time, and help the caller complete their goal."
@@ -33,16 +36,16 @@ DEFAULT_PROMPT_VARIABLES = [
 ]
 DEFAULT_LLM_CONFIG = {
     "provider": "groq",
-    "model": "llama-3.3-70b-versatile",
+    "model": "llama-3.1-8b-instant",
     "temperature": 0.4,
-    "max_tokens": 64,
+    "max_tokens": 48,
     "fallback_providers": ["openai"],
 }
 DEFAULT_AUDIO_CONFIG = {
     "tts_provider": "sarvam",
     "tts_model": "bulbul:v3",
     "tts_voice": "kavya",
-    "tts_language": "hi-IN",
+    "tts_language": "en-IN",
     "stt_provider": "sarvam",
     "stt_model": "saaras:v3",
     "stt_language": "unknown",
@@ -50,11 +53,11 @@ DEFAULT_AUDIO_CONFIG = {
 }
 DEFAULT_ENGINE_CONFIG = {
     "language_profile": "multilingual",
-    "stt_min_endpointing_delay": 0.05,
-    "max_turns": 14,
-    "silence_timeout_seconds": 45,
+    "stt_min_endpointing_delay": 0.25,
+    "max_turns": 8,
+    "silence_timeout_seconds": 6,
     "interruption_words": [],
-    "response_latency_mode": "normal",
+    "response_latency_mode": "fast",
     "agent_tone": "",
     "business_type": "",
     "vertical": "",
@@ -97,10 +100,8 @@ def _tamil_real_estate_template_seed() -> Dict[str, Any]:
         },
         "welcome_message": "Vanakkam, naan unga Tamil real-estate assistant — budget, locality, timeline collect pannuven. Ungalodu pesalaama?",
         "system_prompt": (
-            "You are a courteous Tamil Nadu real-estate voice assistant. "
-            "Prefer short Tanglish unless the buyer asks for Tamil-only. "
-            "Qualify budget range, preferred localities or projects, timeline, home loan vs self-funded, "
-            "and arrange a polite follow-up slot. Capture lead details succinctly."
+            "Speak naturally in Tamil/Tanglish. Reply in one short sentence only. "
+            "Ask one question at a time. Respond fast."
         ),
         "multilingual_prompts": {
             "tamil": "Warm spoken Tamil suited for Chennai/Coimbatore property conversations.",
@@ -139,6 +140,14 @@ def _supabase_settings(service_role: bool = False) -> tuple[str, str]:
     service_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "").strip()
     key = service_key if service_role and service_key else anon_key or service_key
     return url, key
+
+
+def _get_supabase_http_client() -> httpx.Client:
+    global _SUPABASE_HTTP_CLIENT
+    if _SUPABASE_HTTP_CLIENT is None:
+        timeout_s = float(os.getenv("SUPABASE_HTTP_TIMEOUT_SECONDS", "120") or 120)
+        _SUPABASE_HTTP_CLIENT = httpx.Client(timeout=httpx.Timeout(timeout_s))
+    return _SUPABASE_HTTP_CLIENT
 
 
 def _friendly_supabase_error(action: str, error: Exception) -> str:
@@ -236,7 +245,8 @@ def get_supabase(access_token: str | None = None, service_role: bool = False) ->
         logger.error("SUPABASE_URL is invalid. Expected https://<project-ref>.supabase.co")
         return None
     try:
-        client = create_client(url, key)
+        options = ClientOptions(httpx_client=_get_supabase_http_client())
+        client = create_client(url, key, options=options)
         if access_token:
             client.postgrest.auth(access_token)
         return client
@@ -537,6 +547,7 @@ def save_call_log(
     published_agent_uuid: str | None = None,
     started_at: str | None = None,
 ) -> Dict[str, Any]:
+    _db_start = time.perf_counter()
     sb = get_supabase(service_role=True)
     if not sb:
         return {"success": False, "message": "Supabase not configured"}
@@ -576,6 +587,7 @@ def save_call_log(
             res = sb.table("call_logs").insert(payload).execute()
             row = (res.data or [{}])[0]
             rid = row.get("id")
+            logger.info("[DB_SAVE_MS] table=call_logs op=insert id=%s ms=%s", rid, int((time.perf_counter() - _db_start) * 1000))
             logger.info("[CRM] save_call_log success id=%s attempt=%s", rid, attempt + 1)
             return {"success": True, "id": rid}
         except Exception as e:
@@ -595,6 +607,7 @@ def save_call_log(
 
 
 def update_call_log(call_id: Any, **fields: Any) -> Dict[str, Any]:
+    _db_start = time.perf_counter()
     if not call_id:
         return {"success": False, "message": "call_id required"}
     sb = get_supabase(service_role=True)
@@ -607,6 +620,7 @@ def update_call_log(call_id: Any, **fields: Any) -> Dict[str, Any]:
     for attempt in range(2):
         try:
             sb.table("call_logs").update(clean).eq("id", call_id).execute()
+            logger.info("[DB_SAVE_MS] table=call_logs op=update id=%s ms=%s", call_id, int((time.perf_counter() - _db_start) * 1000))
             logger.info("[CRM] update_call_log success id=%s attempt=%s fields=%s", call_id, attempt + 1, list(clean.keys()))
             return {"success": True}
         except Exception as e:
@@ -976,6 +990,94 @@ def _legacy_agent_config(agent: Dict[str, Any], version: Dict[str, Any] | None =
     }
 
 
+def _voice_pipeline_for_runtime(agent: Dict[str, Any], engine_config: Dict[str, Any]) -> str:
+    existing = agent.get("config") if isinstance(agent.get("config"), dict) else {}
+    value = (
+        existing.get("voice_pipeline")
+        or engine_config.get("voice_pipeline")
+        or os.getenv("VOICE_PIPELINE")
+        or "livekit_agents"
+    )
+    value = str(value or "").strip()
+    return value if value in {"livekit_agents", "pipecat"} else "livekit_agents"
+
+
+def _build_agent_runtime_config(agent: Dict[str, Any], version: Dict[str, Any]) -> Dict[str, Any]:
+    llm_config = _merge_json(DEFAULT_LLM_CONFIG, version.get("llm_config"))
+    audio_config = _merge_json(DEFAULT_AUDIO_CONFIG, version.get("audio_config"))
+    engine_config = _merge_json(DEFAULT_ENGINE_CONFIG, version.get("engine_config"))
+    call_config = _merge_json(DEFAULT_CALL_CONFIG, version.get("call_config"))
+    analytics_config = _merge_json(
+        DEFAULT_ANALYTICS_CONFIG,
+        version.get("analytics_config") if isinstance(version.get("analytics_config"), dict) else {},
+    )
+    lc_base = DEFAULT_ENGINE_CONFIG.get("language_config") if isinstance(DEFAULT_ENGINE_CONFIG.get("language_config"), dict) else {}
+    lc_override = engine_config.get("language_config") if isinstance(engine_config.get("language_config"), dict) else {}
+    merged_language_config = {**lc_base, **lc_override}
+    first_line = str(version.get("welcome_message") or "").strip() or FALLBACK_FIRST_LINE
+    agent_instructions = str(version.get("system_prompt") or "").strip() or DEFAULT_SYSTEM_PROMPT
+    voice_pipeline = _voice_pipeline_for_runtime(agent, engine_config)
+    runtime_config = {
+        "agent_id": agent.get("id"),
+        "agent_version_id": version.get("id"),
+        "agent_name": agent.get("name"),
+        "first_line": first_line,
+        "welcome_message": first_line,
+        "welcomeMessage": first_line,
+        "agent_instructions": agent_instructions,
+        "system_prompt": agent_instructions,
+        "prompt": agent_instructions,
+        "multilingual_prompts": version.get("multilingual_prompts") or DEFAULT_MULTILINGUAL_PROMPTS,
+        "prompt_variables": version.get("prompt_variables") or DEFAULT_PROMPT_VARIABLES,
+        "llm_provider": llm_config.get("provider"),
+        "llm_model": llm_config.get("model"),
+        "llm_temperature": llm_config.get("temperature"),
+        "llm_max_tokens": llm_config.get("max_tokens"),
+        "llm_fallback_providers": llm_config.get("fallback_providers") or [],
+        "tts_provider": audio_config.get("tts_provider"),
+        "tts_model": audio_config.get("tts_model"),
+        "tts_voice": audio_config.get("tts_voice"),
+        "tts_language": audio_config.get("tts_language"),
+        "stt_provider": audio_config.get("stt_provider"),
+        "stt_model": audio_config.get("stt_model"),
+        "stt_language": audio_config.get("stt_language"),
+        "noise_suppression": audio_config.get("noise_suppression"),
+        "voice_pipeline": voice_pipeline,
+        "lang_preset": engine_config.get("language_profile") or agent.get("default_language") or "multilingual",
+        "stt_min_endpointing_delay": engine_config.get("stt_min_endpointing_delay"),
+        "max_turns": engine_config.get("max_turns"),
+        "silence_timeout_seconds": engine_config.get("silence_timeout_seconds"),
+        "interruption_words": engine_config.get("interruption_words") or [],
+        "response_latency_mode": engine_config.get("response_latency_mode") or "normal",
+        "vertical": (engine_config.get("vertical") or "").strip(),
+        "language_config": merged_language_config,
+        "llm_config": llm_config,
+        "audio_config": audio_config,
+        "engine_config": {**engine_config, "voice_pipeline": voice_pipeline},
+        "call_config": call_config,
+        "tools_config": version.get("tools_config") or [],
+        "analytics_config": analytics_config,
+    }
+    existing = agent.get("config") if isinstance(agent.get("config"), dict) else {}
+    for key in ("phone", "inbound_number_id", "inbound_assign_enabled"):
+        if key in existing and key not in runtime_config:
+            runtime_config[key] = existing.get(key)
+    return runtime_config
+
+
+def _validate_publishable_runtime_config(version: Dict[str, Any], runtime_config: Dict[str, Any]) -> list[str]:
+    missing: list[str] = []
+    if not str(version.get("welcome_message") or "").strip():
+        missing.append("welcome_message")
+    if not str(version.get("system_prompt") or "").strip():
+        missing.append("agent_prompt")
+    if not str(runtime_config.get("tts_provider") or "").strip() or not str(runtime_config.get("stt_provider") or "").strip():
+        missing.append("voice config")
+    if not str(runtime_config.get("llm_provider") or "").strip() or not str(runtime_config.get("voice_pipeline") or "").strip():
+        missing.append("pipeline config")
+    return missing
+
+
 def _normalize_agent(agent: Dict[str, Any], active_version: Dict[str, Any] | None = None, versions: List[Dict[str, Any]] | None = None) -> Dict[str, Any]:
     row = dict(agent)
     if active_version:
@@ -1302,14 +1404,23 @@ def publish_agent_version(agent_id: str, version_id: str, workspace_id: str, use
         version = _fetch_agent_version(sb, agent_id, version_id)
         if not version:
             return {"success": False, "message": "Agent version not found"}
+        runtime_config = _build_agent_runtime_config(agent, version)
+        missing = _validate_publishable_runtime_config(version, runtime_config)
+        if missing:
+            return {
+                "success": False,
+                "message": "Publish validation failed. Missing: " + ", ".join(missing),
+                "missing": missing,
+            }
         sb.table("agent_versions").update({"status": "archived", "updated_at": _now_iso()}).eq("agent_id", agent_id).eq("status", "published").neq("id", version_id).execute()
         publish_payload = {"status": "published", "published_at": _now_iso(), "updated_at": _now_iso()}
         res = sb.table("agent_versions").update(publish_payload).eq("id", version_id).eq("agent_id", agent_id).execute()
         published = (res.data or [None])[0] or {**version, **publish_payload}
+        runtime_config = _build_agent_runtime_config(agent, published)
         agent_update = {
             "active_version_id": version_id,
             "status": "active",
-            "config": _legacy_agent_config(agent, published),
+            "config": runtime_config,
             "updated_at": _now_iso(),
         }
         published_uuid = agent_id
@@ -1320,7 +1431,16 @@ def publish_agent_version(agent_id: str, version_id: str, workspace_id: str, use
         _audit_agent_event(workspace_id, user_id, "agent_version.published", agent_id, {"version_id": version_id})
         agent_row = get_agent(agent_id, workspace_id, include_versions=True)
         logger.info("[PUBLISHED_AGENT_UUID_CREATED] agent_id=%s published_agent_uuid=%s version_id=%s", agent_id, published_uuid, version_id)
-        logger.info("[AGENT_PUBLISH_SUCCESS] agent_id=%s version_id=%s status=published", agent_id, version_id)
+        logger.info(
+            "[AGENT_PUBLISH_SUCCESS] agent_id=%s version_id=%s status=published first_line=%s voice_pipeline=%s stt_provider=%s tts_provider=%s llm_provider=%s",
+            agent_id,
+            version_id,
+            runtime_config.get("first_line"),
+            runtime_config.get("voice_pipeline"),
+            runtime_config.get("stt_provider"),
+            runtime_config.get("tts_provider"),
+            runtime_config.get("llm_provider"),
+        )
         return {"success": True, "agent": agent_row, "version": published, "published_agent_uuid": published_uuid}
     except Exception as e:
         message = _friendly_supabase_error("Publish agent version", e)
@@ -1446,49 +1566,7 @@ def resolve_agent_runtime_config(agent_id: str, workspace_id: str | None = None)
         return {"success": False, "message": "Agent has no version"}
     if version.get("status") != "published" and (os.getenv("ALLOW_DRAFT_AGENT_CALLS", "").lower() not in {"1", "true", "yes"}):
         return {"success": False, "message": "Agent has no published version. Publish a version before using it for calls."}
-    llm_config = _merge_json(DEFAULT_LLM_CONFIG, version.get("llm_config"))
-    audio_config = _merge_json(DEFAULT_AUDIO_CONFIG, version.get("audio_config"))
-    engine_config = _merge_json(DEFAULT_ENGINE_CONFIG, version.get("engine_config"))
-    call_config = _merge_json(DEFAULT_CALL_CONFIG, version.get("call_config"))
-    lc_base = DEFAULT_ENGINE_CONFIG.get("language_config") if isinstance(DEFAULT_ENGINE_CONFIG.get("language_config"), dict) else {}
-    lc_override = engine_config.get("language_config") if isinstance(engine_config.get("language_config"), dict) else {}
-    merged_language_config = {**lc_base, **lc_override}
-    runtime_config = {
-        "agent_id": agent.get("id"),
-        "agent_version_id": version.get("id"),
-        "agent_name": agent.get("name"),
-        "first_line": version.get("welcome_message") or DEFAULT_WELCOME_MESSAGE,
-        "agent_instructions": version.get("system_prompt") or DEFAULT_SYSTEM_PROMPT,
-        "multilingual_prompts": version.get("multilingual_prompts") or DEFAULT_MULTILINGUAL_PROMPTS,
-        "prompt_variables": version.get("prompt_variables") or DEFAULT_PROMPT_VARIABLES,
-        "llm_provider": llm_config.get("provider"),
-        "llm_model": llm_config.get("model"),
-        "llm_temperature": llm_config.get("temperature"),
-        "llm_max_tokens": llm_config.get("max_tokens"),
-        "llm_fallback_providers": llm_config.get("fallback_providers") or [],
-        "tts_provider": audio_config.get("tts_provider"),
-        "tts_model": audio_config.get("tts_model"),
-        "tts_voice": audio_config.get("tts_voice"),
-        "tts_language": audio_config.get("tts_language"),
-        "stt_provider": audio_config.get("stt_provider"),
-        "stt_model": audio_config.get("stt_model"),
-        "stt_language": audio_config.get("stt_language"),
-        "noise_suppression": audio_config.get("noise_suppression"),
-        "lang_preset": engine_config.get("language_profile") or agent.get("default_language") or "multilingual",
-        "stt_min_endpointing_delay": engine_config.get("stt_min_endpointing_delay"),
-        "max_turns": engine_config.get("max_turns"),
-        "silence_timeout_seconds": engine_config.get("silence_timeout_seconds"),
-        "interruption_words": engine_config.get("interruption_words") or [],
-        "response_latency_mode": engine_config.get("response_latency_mode") or "normal",
-        "vertical": (engine_config.get("vertical") or "").strip(),
-        "language_config": merged_language_config,
-        "call_config": call_config,
-        "tools_config": version.get("tools_config") or [],
-        "analytics_config": _merge_json(
-            DEFAULT_ANALYTICS_CONFIG,
-            version.get("analytics_config") if isinstance(version.get("analytics_config"), dict) else {},
-        ),
-    }
+    runtime_config = _build_agent_runtime_config(agent, version)
     return {
         "success": True,
         "agent_id": agent.get("id"),

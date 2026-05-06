@@ -1,0 +1,10 @@
+{
+  "include": [
+    "backend",
+    "*.py"
+  ],
+  "pythonVersion": "3.11",
+  "extraPaths": [
+    "C:\\Users\\raghu\\AppData\\Local\\Programs\\Python\\Python311\\Lib\\site-packages"
+  ]
+}

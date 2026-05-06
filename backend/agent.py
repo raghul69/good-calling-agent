@@ -212,6 +212,23 @@ def _is_exit_intent(text: str) -> bool:
     return bool(_EXIT_INTENT_RE.search(_normalize_voice_text(text)))
 
 
+def _is_valid_voice_response(text: str) -> bool:
+    cleaned = _sanitize_tts_text(text)
+    if not cleaned:
+        return False
+    words = [w for w in re.split(r"\s+", _normalize_voice_text(cleaned)) if len(w) > 1]
+    if len(words) < 4:
+        return False
+    blocked = {
+        "maxr",
+        "hello sir voice",
+        "seri sir vera",
+        "sorry sir simple",
+        "okay sir",
+    }
+    return _normalize_voice_text(cleaned) not in blocked
+
+
 def _limit_voice_words(text: str, max_words: int = 12) -> str:
     words = str(text or "").strip().split()
     if len(words) <= max_words:
@@ -233,8 +250,17 @@ def _sanitize_tts_text(text: str) -> str:
 def _voice_tts_chunks(text: str, max_words: int = 12) -> tuple[list[str], int]:
     raw = str(text or "").strip()
     sentences = _split_sentences(raw)
-    first_sentence = next((s for s in sentences if "?" in s), sentences[0] if sentences else raw)
-    chunk = _sanitize_tts_text(_limit_voice_words(first_sentence, max_words=max_words))
+    questions = [s for s in sentences if "?" in s]
+    candidates = questions + sentences + ([raw] if raw else [])
+    selected = ""
+    for candidate in candidates:
+        words = [w for w in re.split(r"\s+", _normalize_voice_text(candidate)) if len(w) > 1]
+        if len(words) >= 4:
+            selected = candidate
+            break
+    if not selected:
+        selected = candidates[0] if candidates else raw
+    chunk = _sanitize_tts_text(_limit_voice_words(selected, max_words=max_words))
     return ([chunk] if chunk else []), len(sentences)
 
 
@@ -524,6 +550,7 @@ class OutboundAssistant(Agent):
             str(live_config_loaded.get("vertical") or "").strip().lower() == "tamil_real_estate"
             or str(live_config_loaded.get("response_latency_mode") or "").strip().lower() == "fast"
         )
+        logger.info("[HYBRID_MODE_ENABLED] fast_router_high_confidence_only=true controller_guard_only=true")
         self._fast_router = FastVoiceRouter()
         self._active_response_task: asyncio.Task[Any] | None = None
         self._barge_in = BargeInController()
@@ -536,9 +563,9 @@ class OutboundAssistant(Agent):
         lang_instruction = get_language_instruction(lang_preset)
         cost_guardrail = (
             "\n\n[VOICE STYLE]\n"
-            "Reply in one short sentence only. "
-            "Use at most 9 Tamil/Tanglish words in fast mode; otherwise at most 12. "
-            "Use simple Tanglish, not formal Tamil. "
+            "Reply naturally in short Chennai Tanglish. "
+            "Use warm acknowledgements before one useful follow-up. "
+            "Do not sound like a rigid form or stage machine. "
             "Ask one question at a time. Do not repeat the same question twice. "
             "If the caller says hello/not clear/speak properly/I don't understand/puriyala, apologize briefly, switch simpler English/Tanglish, and continue."
         )
@@ -568,9 +595,8 @@ class OutboundAssistant(Agent):
         duplicate_response = norm == self._last_assistant_norm
         duplicate_question = _is_question_like(cleaned) and norm in self._recent_question_norms
         if duplicate_response or duplicate_question:
-            logger.info("[DUPLICATE_RESPONSE_GUARD] duplicate_response=%s duplicate_question=%s text=%s", duplicate_response, duplicate_question, cleaned[:120])
-            cleaned = "Seri sir, vera simple-ah: area preference irukka?"
-            norm = _normalize_voice_text(cleaned)
+            logger.info("[DUPLICATE_BLOCKED] duplicate_response=%s duplicate_question=%s text=%s", duplicate_response, duplicate_question, cleaned[:120])
+            return ""
         self._last_assistant_norm = norm
         if _is_question_like(cleaned):
             self._last_question_norm = norm
@@ -632,6 +658,9 @@ class OutboundAssistant(Agent):
         if not text:
             logger.info("[TTS_CHUNK_SKIPPED] reason=no_speakable_text")
             return
+        if lifecycle != "greeting" and not _is_valid_voice_response(text):
+            logger.info("[FRAGMENT_BLOCKED] source=%s text=%s", lifecycle or "say_guarded", text[:120])
+            return
         speak_start = time.perf_counter()
         handle = self.session.say(text, allow_interruptions=allow_interruptions)
         publish_ms = _ms_since(speak_start)
@@ -652,7 +681,7 @@ class OutboundAssistant(Agent):
         if not self._fast_pipeline_enabled:
             return
         result = self._fast_router.note_partial(text)
-        if result.handled and agent_is_speaking:
+        if result.handled and result.confidence >= 0.9 and agent_is_speaking:
             self._barge_in.note_user_speech(text)
             self._barge_in.interrupt(self.session, self._active_response_task, reason=f"early_intent:{result.intent}")
 
@@ -710,6 +739,9 @@ class OutboundAssistant(Agent):
                     if not chunk:
                         logger.info("[TTS_CHUNK_SKIPPED] reason=no_speakable_text")
                         continue
+                    if not _is_valid_voice_response(chunk):
+                        logger.info("[FRAGMENT_BLOCKED] source=livekit_tts_stream text=%s", chunk[:120])
+                        continue
                     chunk_count += 1
                     if not first_logged:
                         first_logged = True
@@ -728,6 +760,9 @@ class OutboundAssistant(Agent):
                     chunk = _sanitize_tts_text(chunk)
                     if not chunk:
                         logger.info("[TTS_CHUNK_SKIPPED] reason=no_speakable_text")
+                        continue
+                    if not _is_valid_voice_response(chunk):
+                        logger.info("[FRAGMENT_BLOCKED] source=livekit_tts_stream text=%s", chunk[:120])
                         continue
                     chunk_count += 1
                     if not first_logged:
@@ -773,13 +808,11 @@ class OutboundAssistant(Agent):
         turn_ctx: llm.ChatContext,
         new_message: llm.ChatMessage,
     ) -> None:
-        orch = self._orchestrator
-        if orch is None:
-            return
         text = (new_message.text_content or "").strip()
         if not text:
             return
         self.begin_committed_user_turn(text)
+        logger.info("[CONTROLLER_GUARD_ONLY] turn_id=%s", self.current_turn_id)
         if self.conversation_ended:
             raise StopResponse()
         if self.response_sent_for_turn or self.is_waiting_for_user:
@@ -787,19 +820,21 @@ class OutboundAssistant(Agent):
             raise StopResponse()
         if _is_exit_intent(text):
             logger.info("[EXIT_DETECTED] turn_id=%s text=%s", self.current_turn_id, text[:120])
-            await self._say_guarded("Okay sir, thanks.", allow_interruptions=True, wait=True, lifecycle="exit_intent")
+            await self._say_guarded("Okay sir, thanks, call cut pannuren.", allow_interruptions=True, wait=True, lifecycle="exit_intent")
             self.conversation_ended = True
             raise StopResponse()
         if _is_soft_ack(text):
             logger.info("[SOFT_ACK_DETECTED] turn_id=%s text=%s", self.current_turn_id, text[:120])
-            await self._say_guarded("Seri sir.", allow_interruptions=True, wait=True, lifecycle="soft_ack")
+            self.is_waiting_for_user = True
+            logger.info("[WAITING_FOR_USER] turn_id=%s source=soft_ack_silent", self.current_turn_id)
             raise StopResponse()
         if self._fast_pipeline_enabled:
             self._fast_router.start_turn()
             fast_action = self._fast_router.route_final(text)
-            if fast_action.handled and fast_action.message:
+            if fast_action.handled and fast_action.message and fast_action.confidence >= 0.9:
                 logger.info("[FAST_PIPELINE] llm_skipped intent=%s stage=%s", fast_action.intent, fast_action.stage)
                 logger.info("[CONTROLLER_OWNED_REPLY] turn_id=%s source=fast_router intent=%s", self.current_turn_id, fast_action.intent or "-")
+                logger.info("[LIVEKIT_REPLY_SKIPPED_HIGH_CONFIDENCE] turn_id=%s intent=%s", self.current_turn_id, fast_action.intent or "-")
                 self._voice_latency.log(
                     stage=self._fast_router.state.stage,
                     stt_partial_ms=self._fast_router.last_partial_ms,
@@ -807,98 +842,23 @@ class OutboundAssistant(Agent):
                 )
                 await self._say_guarded(fast_action.message, allow_interruptions=True, lifecycle="fast_router")
                 raise StopResponse()
-            if fast_action.needs_llm:
-                logger.info("[FAST_PIPELINE] llm_path=streaming_agent reason=%s", fast_action.intent or "complex")
-                return
+            logger.info(
+                "[ROUTER_LOW_CONFIDENCE] turn_id=%s intent=%s confidence=%s handled=%s",
+                self.current_turn_id,
+                fast_action.intent or "complex",
+                fast_action.confidence,
+                fast_action.handled,
+            )
+            logger.info("[LIVEKIT_REPLY_ALLOWED] turn_id=%s reason=normal_conversation", self.current_turn_id)
+            return
         if _is_confused_user(text):
             logger.info("[CONFUSION_DETECTED] text=%s", text[:120])
             if self._fallback_allowed_for_stage():
                 logger.info("[CONTROLLER_OWNED_REPLY] turn_id=%s source=confusion_fallback", self.current_turn_id)
                 await self._say_guarded(self._fallback_recovery_line(text), allow_interruptions=True, lifecycle="confusion_fallback")
             raise StopResponse()
-        orch_start = time.perf_counter()
-        try:
-            action = await asyncio.wait_for(
-                orch.handle_user_message(text),
-                timeout=max(0.6, self._response_timeout_s),
-            )
-        except asyncio.TimeoutError:
-            logger.warning("[RESPONSE_TIMEOUT] orchestrator exceeded %.2fs text=%s", self._response_timeout_s, text[:120])
-            if self._fallback_allowed_for_stage():
-                logger.info("[CONTROLLER_OWNED_REPLY] turn_id=%s source=response_timeout_fallback", self.current_turn_id)
-                await self._say_guarded("One sec sir, simple-ah ketkaren. Area preference irukka?", allow_interruptions=True, lifecycle="response_timeout_fallback")
-            raise StopResponse()
-        except Exception as e:
-            logger.exception("[ORCHESTRATOR] failed; using recovery prompt: %s", e)
-            if self._fallback_allowed_for_stage():
-                logger.info("[CONTROLLER_OWNED_REPLY] turn_id=%s source=orchestrator_error_fallback", self.current_turn_id)
-                await self._say_guarded("Sorry sir, repeat panren. Which area looking?", allow_interruptions=True, lifecycle="orchestrator_error_fallback")
-            raise StopResponse()
-        if self._latency_tracker is not None:
-            self._latency_tracker.note_orchestrator_llm(_ms_since(orch_start))
-        if action.type == "speak":
-            line = (action.orchestration_message or action.next_question or "").strip()
-            if line:
-                logger.info("[CONTROLLER_OWNED_REPLY] turn_id=%s source=orchestrator_speak", self.current_turn_id)
-                await self._say_guarded(line, allow_interruptions=True, lifecycle="orchestrator_speak")
-            raise StopResponse()
-        if action.type == "noop":
-            raise StopResponse()
-
-        sess = self.session
-        at = self._agent_tools
-
-        if action.type == "transfer":
-            await at.transfer_call(reason=action.reason or "orchestrator_brain")
-            raise StopResponse()
-
-        if action.type == "end_call":
-            await at.end_call(reason=action.reason or "orchestrator_brain")
-            raise StopResponse()
-
-        if action.type == "schedule_callback":
-            line = (action.orchestration_message or action.next_question or "").strip()
-            if line:
-                logger.info("[CONTROLLER_OWNED_REPLY] turn_id=%s source=schedule_callback", self.current_turn_id)
-                await self._say_guarded(line, allow_interruptions=True, wait=True, lifecycle="schedule_callback")
-            if self._tool_executor is not None:
-                await self._tool_executor.execute(
-                    "schedule_callback",
-                    {"snippet": text[:800], **(action.payload or {})},
-                )
-            raise StopResponse()
-
-        if action.type == "send_whatsapp":
-            line = (action.orchestration_message or action.next_question or "").strip()
-            if line:
-                logger.info("[CONTROLLER_OWNED_REPLY] turn_id=%s source=send_whatsapp", self.current_turn_id)
-                await self._say_guarded(line, allow_interruptions=True, wait=True, lifecycle="send_whatsapp")
-            if self._tool_executor is not None:
-                await self._tool_executor.execute(
-                    "send_whatsapp",
-                    {"snippet": text[:800], **(action.payload or {})},
-                )
-            raise StopResponse()
-
-        if action.type == "tool_call":
-            await self._orch_run_tool(action)
-            raise StopResponse()
-
-        if action.type == "save_data":
-            if self._tool_executor is not None:
-                await self._tool_executor.execute(
-                    "save_lead",
-                    {"snippet": text[:800], **(action.payload or {})},
-                )
-            ack = (action.orchestration_message or "").strip() or "Thanks — I've noted that."
-            try:
-                logger.info("[CONTROLLER_OWNED_REPLY] turn_id=%s source=save_data", self.current_turn_id)
-                await self._say_guarded(ack, allow_interruptions=True, wait=True, lifecycle="save_data")
-            except Exception as e:
-                logger.warning("[ORCHESTRATOR] save_data say failed: %s", e)
-            raise StopResponse()
-
-        raise StopResponse()
+        logger.info("[LIVEKIT_REPLY_ALLOWED] turn_id=%s reason=controller_guard_only", self.current_turn_id)
+        return
 
 
 # ══════════════════════════════════════════════════════════════════════════════

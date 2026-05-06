@@ -28,7 +28,7 @@ class FastVoiceRouter:
     INTRO_RESPONSE = "MAXR Consultancy la irundhu property regarding call panniruken sir."
     BUSY_RESPONSE = "No problem sir, convenient time la call pannaren."
     WRONG_NUMBER_RESPONSE = "Sorry sir, wrong number disturb panniten."
-    CUT_CALL_RESPONSE = "Seri sir, thanks. Call cut pannuren."
+    CUT_CALL_RESPONSE = "Okay sir, thanks, call cut pannuren."
     PROPERTY_TYPE_QUESTION = "Flat venuma illa plot venuma sir?"
     AREA_QUESTION = "Chennai la endha area property venum sir?"
     BUDGET_QUESTION = "Budget approx evlo sir?"
@@ -71,7 +71,7 @@ class FastVoiceRouter:
         if result.handled and result.stage:
             self.state.last_stage = self.state.stage
             self.state.stage = result.stage
-        if result.handled and result.message:
+        if result.handled and result.message and result.confidence >= 0.9:
             result.message = self._guard_repeated_question(result.message, result.intent, result.allow_repeat)
             self.state.last_agent_text = result.message
         self.last_router_ms = self._ms_since(start)
@@ -90,6 +90,13 @@ class FastVoiceRouter:
                 result.intent or "-",
                 (result.message or "")[:120],
             )
+        elif result.intent:
+            logger.info(
+                "[ROUTER_LOW_CONFIDENCE] stage=%s intent=%s confidence=%s",
+                self.state.stage,
+                result.intent,
+                result.confidence,
+            )
         return result
 
     def mark_agent_reply(self, text: str, *, question_key: str = "") -> None:
@@ -106,34 +113,34 @@ class FastVoiceRouter:
 
         if has_voice_pattern(r"\b(hello+|helo+|hallo+|hi|hey)\b", low):
             logger.info("[CONFUSION_DETECTED] phrase=hello stage=%s", self.state.stage)
-            return FastRouteResult(True, self.CLEAR_CHECK, "hello", "collect_language", allow_repeat=True)
+            return FastRouteResult(True, self.CLEAR_CHECK, "hello", "collect_language", allow_repeat=True, confidence=0.95)
         if has_voice_pattern(r"\b(what|what is it|enna|edhukku|yaru|who is this)\b", low):
-            return FastRouteResult(True, self.INTRO_RESPONSE, "what_is_it", self.state.stage, allow_repeat=True)
+            return FastRouteResult(True, self.INTRO_RESPONSE, "what_is_it", self.state.stage, allow_repeat=True, confidence=0.95)
         if has_voice_pattern(r"\b(not clear|speak properly|speak clearly|i don'?t understand|don'?t understand|dont understand|puriyala|theriyala|clear ah illa)\b", low):
             logger.info("[CONFUSION_DETECTED] phrase=unclear stage=%s", self.state.stage)
-            return FastRouteResult(True, self.CONFUSION_RESPONSE, "confused", "collect_language", allow_repeat=True)
+            return FastRouteResult(True, self.CONFUSION_RESPONSE, "confused", "collect_language", allow_repeat=True, confidence=0.95)
         if has_voice_pattern(r"\b(repeat|again|once more|innoru thadava|marubadi|thirumba)\b", low):
-            return FastRouteResult(True, self.state.last_agent_text or self.PROPERTY_TYPE_QUESTION, "repeat", self.state.stage, allow_repeat=True)
+            return FastRouteResult(True, self.state.last_agent_text or self.PROPERTY_TYPE_QUESTION, "repeat", self.state.stage, allow_repeat=True, confidence=0.95)
         if has_voice_pattern(r"\b(busy|velai|meeting|later|call later)\b", low):
-            return FastRouteResult(True, self.BUSY_RESPONSE, "busy", "completed", allow_repeat=True)
+            return FastRouteResult(False, intent="busy", needs_llm=True, confidence=0.4)
         if has_voice_pattern(r"\b(wrong number|wrong person|number wrong|thappu number|wrong call)\b", low):
-            return FastRouteResult(True, self.WRONG_NUMBER_RESPONSE, "wrong_number", "completed", allow_repeat=True)
-        if has_voice_pattern(r"\b(cut the call|cut call|disconnect|hang up|phone cut|call cut|vachudunga)\b", low):
-            return FastRouteResult(True, self.CUT_CALL_RESPONSE, "cut_call", "completed", allow_repeat=True)
+            return FastRouteResult(True, self.WRONG_NUMBER_RESPONSE, "wrong_number", "completed", allow_repeat=True, confidence=0.95)
+        if has_voice_pattern(r"\b(cut the call|cut call|disconnect|hang up|phone cut|call cut|vachudunga|bye|goodbye|thank you|thanks|not interested|vendam|venam)\b", low):
+            return FastRouteResult(True, self.CUT_CALL_RESPONSE, "cut_call", "completed", allow_repeat=True, confidence=0.95)
         if has_voice_pattern(r"\b(tamil|tamizh)\b", low):
             self.state.language_preference = "tamil"
             self.state.answered_fields.add("language")
-            return FastRouteResult(True, self.PROPERTY_TYPE_QUESTION, "language_tamil", "collect_property_type")
+            return FastRouteResult(False, intent="language_tamil", needs_llm=True, confidence=0.35)
         if has_voice_pattern(r"\b(english|inglish)\b", low):
             self.state.language_preference = "english"
             self.state.answered_fields.add("language")
-            return FastRouteResult(True, self.PROPERTY_TYPE_QUESTION, "language_english", "collect_property_type")
+            return FastRouteResult(False, intent="language_english", needs_llm=True, confidence=0.35)
 
         if is_property_type_answer(raw):
             self.state.property_type = raw[:80]
             self.state.fields["property_type"] = self.state.property_type
             self.state.answered_fields.add("property_type")
-            return FastRouteResult(True, self.AREA_QUESTION, "property_type_answer", "collect_area")
+            return FastRouteResult(False, intent="property_type_answer", needs_llm=True, confidence=0.35)
 
         if self._contains_area_signal(raw) and is_budget_answer(raw):
             self.state.area = raw[:80]
@@ -141,36 +148,36 @@ class FastVoiceRouter:
             self.state.fields["area"] = self.state.area
             self.state.fields["budget"] = self.state.budget
             self.state.answered_fields.update({"area", "budget"})
-            return FastRouteResult(True, self.TIMELINE_QUESTION, "area_budget_answer", "collect_timeline")
+            return FastRouteResult(False, intent="area_budget_answer", needs_llm=True, confidence=0.35)
 
         if is_area_answer(raw):
             self.state.area = raw[:80]
             self.state.fields["area"] = self.state.area
             self.state.answered_fields.add("area")
-            return FastRouteResult(True, self.BUDGET_QUESTION, "area_answer", "collect_budget")
+            return FastRouteResult(False, intent="area_answer", needs_llm=True, confidence=0.35)
 
         if is_budget_answer(raw):
             self.state.budget = raw[:80]
             self.state.fields["budget"] = self.state.budget
             self.state.answered_fields.add("budget")
-            return FastRouteResult(True, self.TIMELINE_QUESTION, "budget_answer", "collect_timeline")
+            return FastRouteResult(False, intent="budget_answer", needs_llm=True, confidence=0.35)
 
         if has_voice_pattern(r"\b(today|tomorrow|weekend|this week|next week|immediate|immediately|month|months|later)\b", low):
             self.state.timeline = raw[:80]
             self.state.fields["timeline"] = self.state.timeline
             self.state.answered_fields.add("timeline")
-            return FastRouteResult(True, self.SITE_VISIT_QUESTION, "timeline_answer", "offer_site_visit")
+            return FastRouteResult(False, intent="timeline_answer", needs_llm=True, confidence=0.35)
 
         if has_voice_pattern(r"\b(yes|yeah|ok|okay|seri|sure|pannalam|venum|interested)\b", low):
             if self.state.stage == "offer_site_visit":
                 self.state.appointment_confirmed = True
-                return FastRouteResult(True, "Super sir, unga name sollunga?", "site_visit_yes", "completed")
-            return FastRouteResult(True, self._next_question_for_stage(), "yes_continue", self.state.stage)
+                return FastRouteResult(False, intent="site_visit_yes", needs_llm=True, confidence=0.4)
+            return FastRouteResult(False, intent="yes_continue", needs_llm=True, confidence=0.3)
 
         if has_voice_pattern(r"\b(no|illa|vendam|not interested)\b", low):
             if self.state.stage == "offer_site_visit":
-                return FastRouteResult(True, "No problem sir, WhatsApp details send pannalama?", "site_visit_no", "completed")
-            return FastRouteResult(True, self._next_question_for_stage(), "no_continue", self.state.stage)
+                return FastRouteResult(False, intent="site_visit_no", needs_llm=True, confidence=0.4)
+            return FastRouteResult(False, intent="no_continue", needs_llm=True, confidence=0.3)
 
         if partial:
             return FastRouteResult(False, intent="", needs_llm=False, confidence=0.0)

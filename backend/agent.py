@@ -168,6 +168,11 @@ _CONFUSION_RE = re.compile(
 )
 _QUESTION_RE = re.compile(r"[?？]\s*$|\b(sollunga|tell me|can you|will you|shall we|pannalama)\b", re.IGNORECASE)
 _TTS_SPEAKABLE_RE = re.compile(r"[A-Za-z0-9\u0900-\u097f\u0b80-\u0bff]")
+_SOFT_ACK_RE = re.compile(r"^(h+m+|m+m+|ok(?:ay)?|yes|yeah|seri|sari|sure|haan|han|hmm|mmm|mm)$", re.IGNORECASE)
+_EXIT_INTENT_RE = re.compile(
+    r"\b(thank\s*you|thanks|bye|goodbye|cut|cut\s+call|go\s+home|not\s+interested|vendam|venam|podhum)\b",
+    re.IGNORECASE,
+)
 
 
 def _split_sentences(text: str) -> list[str]:
@@ -197,6 +202,14 @@ def _is_confused_user(text: str) -> bool:
 
 def _is_question_like(text: str) -> bool:
     return bool(_QUESTION_RE.search(str(text or "").strip()))
+
+
+def _is_soft_ack(text: str) -> bool:
+    return bool(_SOFT_ACK_RE.match(_normalize_voice_text(text)))
+
+
+def _is_exit_intent(text: str) -> bool:
+    return bool(_EXIT_INTENT_RE.search(_normalize_voice_text(text)))
 
 
 def _limit_voice_words(text: str, max_words: int = 12) -> str:
@@ -499,6 +512,12 @@ class OutboundAssistant(Agent):
         self._last_question_norm = ""
         self._recent_question_norms: list[str] = []
         self._confusion_count = 0
+        self.current_turn_id = 0
+        self.response_sent_for_turn = False
+        self.is_waiting_for_user = False
+        self.conversation_ended = False
+        self._last_committed_user_norm = ""
+        self._fallback_used_stages: set[str] = set()
         live_config_loaded = self._live_config
         self._response_timeout_s = float(live_config_loaded.get("response_timeout_seconds") or 1.2)
         self._fast_pipeline_enabled = (
@@ -558,6 +577,47 @@ class OutboundAssistant(Agent):
             self._recent_question_norms = (self._recent_question_norms + [norm])[-5:]
         return cleaned
 
+    def begin_committed_user_turn(self, text: str) -> int:
+        norm = _normalize_voice_text(text)
+        if norm and norm != self._last_committed_user_norm:
+            self.current_turn_id += 1
+            self.response_sent_for_turn = False
+            self.is_waiting_for_user = False
+            self._last_committed_user_norm = norm
+            logger.info("[TURN_UNLOCKED] turn_id=%s transcript=%s", self.current_turn_id, str(text or "")[:120])
+        return self.current_turn_id
+
+    def _can_send_for_current_turn(self, *, source: str) -> bool:
+        if self.conversation_ended:
+            logger.info("[MULTI_REPLY_BLOCKED] turn_id=%s source=%s reason=conversation_ended", self.current_turn_id, source)
+            return False
+        if self.response_sent_for_turn:
+            logger.info("[MULTI_REPLY_BLOCKED] turn_id=%s source=%s reason=response_already_sent", self.current_turn_id, source)
+            return False
+        if self.is_waiting_for_user:
+            logger.info("[MULTI_REPLY_BLOCKED] turn_id=%s source=%s reason=waiting_for_user", self.current_turn_id, source)
+            return False
+        return True
+
+    def _mark_response_sent(self, *, source: str) -> None:
+        self.response_sent_for_turn = True
+        self.is_waiting_for_user = True
+        logger.info("[TURN_SENT] turn_id=%s source=%s", self.current_turn_id, source)
+        logger.info("[WAITING_FOR_USER] turn_id=%s", self.current_turn_id)
+
+    def note_external_assistant_response(self, *, source: str = "external_assistant") -> None:
+        if self.response_sent_for_turn:
+            return
+        self._mark_response_sent(source=source)
+
+    def _fallback_allowed_for_stage(self) -> bool:
+        stage = str(self._fast_router.state.stage or "unknown")
+        if stage in self._fallback_used_stages:
+            logger.info("[FALLBACK_SKIPPED_ALREADY_USED] stage=%s turn_id=%s", stage, self.current_turn_id)
+            return False
+        self._fallback_used_stages.add(stage)
+        return True
+
     async def _say_guarded(
         self,
         line: str,
@@ -566,6 +626,8 @@ class OutboundAssistant(Agent):
         wait: bool = False,
         lifecycle: str = "",
     ) -> None:
+        if lifecycle != "greeting" and not self._can_send_for_current_turn(source=lifecycle or "say_guarded"):
+            return
         text = _sanitize_tts_text(self._dedupe_reply(line))
         if not text:
             logger.info("[TTS_CHUNK_SKIPPED] reason=no_speakable_text")
@@ -578,8 +640,13 @@ class OutboundAssistant(Agent):
         logger.info("[VOICE_LATENCY] stage=%s livekit_publish_ms=%s chars=%s", self._fast_router.state.stage, publish_ms, len(text))
         self._voice_latency.log(stage=self._fast_router.state.stage, livekit_publish_ms=publish_ms)
         self._fast_router.mark_agent_reply(text)
+        if lifecycle != "greeting":
+            self._mark_response_sent(source=lifecycle or "say_guarded")
         if wait:
             await handle.wait_for_playout()
+
+    async def _say_tool_guarded(self, line: str, *, source: str = "tool_call") -> None:
+        await self._say_guarded(line, allow_interruptions=True, wait=True, lifecycle=source)
 
     def handle_partial_transcript(self, text: str) -> None:
         if not self._fast_pipeline_enabled:
@@ -683,18 +750,13 @@ class OutboundAssistant(Agent):
         assert isinstance(action, AgentAction)
         name = (action.tool_name or "").strip()
         pl = action.payload or {}
-        sess = self.session
         at = self._agent_tools
         if name == "check_availability":
             msg = await at.check_availability(pl.get("date") or "")
         elif name == "get_business_hours":
             msg = await at.get_business_hours()
         elif name == "save_booking_intent":
-            h = sess.say(
-                "Sure sir, preferred date and time sollunga.",
-                allow_interruptions=True,
-            )
-            await h.wait_for_playout()
+            await self._say_tool_guarded("Sure sir, preferred date and time sollunga.", source="tool_save_booking_intent")
             return
         else:
             execr = self._tool_executor
@@ -704,8 +766,7 @@ class OutboundAssistant(Agent):
                 res = await execr.execute(name, pl)
                 msg = "Done." if res.get("ok") else "Sorry, that didn't work."
         text = (msg if isinstance(msg, str) else str(msg))[:1200]
-        h = sess.say(_limit_voice_words(text, max_words=10), allow_interruptions=True)
-        await h.wait_for_playout()
+        await self._say_tool_guarded(_limit_voice_words(text, max_words=10), source=f"tool_{name or 'unknown'}")
 
     async def on_user_turn_completed(
         self,
@@ -718,24 +779,42 @@ class OutboundAssistant(Agent):
         text = (new_message.text_content or "").strip()
         if not text:
             return
+        self.begin_committed_user_turn(text)
+        if self.conversation_ended:
+            raise StopResponse()
+        if self.response_sent_for_turn or self.is_waiting_for_user:
+            logger.info("[MULTI_REPLY_BLOCKED] turn_id=%s source=on_user_turn_completed reason=locked_before_routing", self.current_turn_id)
+            raise StopResponse()
+        if _is_exit_intent(text):
+            logger.info("[EXIT_DETECTED] turn_id=%s text=%s", self.current_turn_id, text[:120])
+            await self._say_guarded("Okay sir, thanks.", allow_interruptions=True, wait=True, lifecycle="exit_intent")
+            self.conversation_ended = True
+            raise StopResponse()
+        if _is_soft_ack(text):
+            logger.info("[SOFT_ACK_DETECTED] turn_id=%s text=%s", self.current_turn_id, text[:120])
+            await self._say_guarded("Seri sir.", allow_interruptions=True, wait=True, lifecycle="soft_ack")
+            raise StopResponse()
         if self._fast_pipeline_enabled:
             self._fast_router.start_turn()
             fast_action = self._fast_router.route_final(text)
             if fast_action.handled and fast_action.message:
                 logger.info("[FAST_PIPELINE] llm_skipped intent=%s stage=%s", fast_action.intent, fast_action.stage)
+                logger.info("[CONTROLLER_OWNED_REPLY] turn_id=%s source=fast_router intent=%s", self.current_turn_id, fast_action.intent or "-")
                 self._voice_latency.log(
                     stage=self._fast_router.state.stage,
                     stt_partial_ms=self._fast_router.last_partial_ms,
                     router_ms=self._fast_router.last_router_ms,
                 )
-                await self._say_guarded(fast_action.message, allow_interruptions=True)
+                await self._say_guarded(fast_action.message, allow_interruptions=True, lifecycle="fast_router")
                 raise StopResponse()
             if fast_action.needs_llm:
                 logger.info("[FAST_PIPELINE] llm_path=streaming_agent reason=%s", fast_action.intent or "complex")
                 return
         if _is_confused_user(text):
             logger.info("[CONFUSION_DETECTED] text=%s", text[:120])
-            await self._say_guarded(self._fallback_recovery_line(text), allow_interruptions=True)
+            if self._fallback_allowed_for_stage():
+                logger.info("[CONTROLLER_OWNED_REPLY] turn_id=%s source=confusion_fallback", self.current_turn_id)
+                await self._say_guarded(self._fallback_recovery_line(text), allow_interruptions=True, lifecycle="confusion_fallback")
             raise StopResponse()
         orch_start = time.perf_counter()
         try:
@@ -745,18 +824,23 @@ class OutboundAssistant(Agent):
             )
         except asyncio.TimeoutError:
             logger.warning("[RESPONSE_TIMEOUT] orchestrator exceeded %.2fs text=%s", self._response_timeout_s, text[:120])
-            await self._say_guarded("One sec sir, simple-ah ketkaren. Area preference irukka?", allow_interruptions=True)
+            if self._fallback_allowed_for_stage():
+                logger.info("[CONTROLLER_OWNED_REPLY] turn_id=%s source=response_timeout_fallback", self.current_turn_id)
+                await self._say_guarded("One sec sir, simple-ah ketkaren. Area preference irukka?", allow_interruptions=True, lifecycle="response_timeout_fallback")
             raise StopResponse()
         except Exception as e:
             logger.exception("[ORCHESTRATOR] failed; using recovery prompt: %s", e)
-            await self._say_guarded("Sorry sir, repeat panren. Which area looking?", allow_interruptions=True)
+            if self._fallback_allowed_for_stage():
+                logger.info("[CONTROLLER_OWNED_REPLY] turn_id=%s source=orchestrator_error_fallback", self.current_turn_id)
+                await self._say_guarded("Sorry sir, repeat panren. Which area looking?", allow_interruptions=True, lifecycle="orchestrator_error_fallback")
             raise StopResponse()
         if self._latency_tracker is not None:
             self._latency_tracker.note_orchestrator_llm(_ms_since(orch_start))
         if action.type == "speak":
             line = (action.orchestration_message or action.next_question or "").strip()
             if line:
-                await self._say_guarded(line, allow_interruptions=True)
+                logger.info("[CONTROLLER_OWNED_REPLY] turn_id=%s source=orchestrator_speak", self.current_turn_id)
+                await self._say_guarded(line, allow_interruptions=True, lifecycle="orchestrator_speak")
             raise StopResponse()
         if action.type == "noop":
             raise StopResponse()
@@ -775,7 +859,8 @@ class OutboundAssistant(Agent):
         if action.type == "schedule_callback":
             line = (action.orchestration_message or action.next_question or "").strip()
             if line:
-                await self._say_guarded(line, allow_interruptions=True, wait=True)
+                logger.info("[CONTROLLER_OWNED_REPLY] turn_id=%s source=schedule_callback", self.current_turn_id)
+                await self._say_guarded(line, allow_interruptions=True, wait=True, lifecycle="schedule_callback")
             if self._tool_executor is not None:
                 await self._tool_executor.execute(
                     "schedule_callback",
@@ -786,7 +871,8 @@ class OutboundAssistant(Agent):
         if action.type == "send_whatsapp":
             line = (action.orchestration_message or action.next_question or "").strip()
             if line:
-                await self._say_guarded(line, allow_interruptions=True, wait=True)
+                logger.info("[CONTROLLER_OWNED_REPLY] turn_id=%s source=send_whatsapp", self.current_turn_id)
+                await self._say_guarded(line, allow_interruptions=True, wait=True, lifecycle="send_whatsapp")
             if self._tool_executor is not None:
                 await self._tool_executor.execute(
                     "send_whatsapp",
@@ -806,7 +892,8 @@ class OutboundAssistant(Agent):
                 )
             ack = (action.orchestration_message or "").strip() or "Thanks — I've noted that."
             try:
-                await self._say_guarded(ack, allow_interruptions=True, wait=True)
+                logger.info("[CONTROLLER_OWNED_REPLY] turn_id=%s source=save_data", self.current_turn_id)
+                await self._say_guarded(ack, allow_interruptions=True, wait=True, lifecycle="save_data")
             except Exception as e:
                 logger.warning("[ORCHESTRATOR] save_data say failed: %s", e)
             raise StopResponse()
@@ -1646,7 +1733,10 @@ async def entrypoint(ctx: JobContext):
                 logger.info("[INACTIVITY] No caller speech for %ss; ending call.", silence_timeout_seconds)
                 shutdown_requested = True
                 try:
-                    await session.generate_reply(instructions=inactivity_instructions)
+                    if agent._can_send_for_current_turn(source="inactivity_watchdog"):
+                        await agent._say_guarded("Okay sir, thanks.", allow_interruptions=True, wait=True, lifecycle="inactivity_watchdog")
+                    else:
+                        logger.info("[WAITING_FOR_USER] turn_id=%s source=inactivity_watchdog_no_reply", agent.current_turn_id)
                 except Exception:
                     pass
                 try:
@@ -1668,9 +1758,10 @@ async def entrypoint(ctx: JobContext):
             logger.info("[CALL_CONFIG] total_call_timeout_seconds reached (%s)", max_dur)
             shutdown_requested = True
             try:
-                await session.generate_reply(
-                    instructions="Politely tell the caller the maximum call time has been reached and say goodbye.",
-                )
+                if agent._can_send_for_current_turn(source="max_call_duration_watchdog"):
+                    await agent._say_guarded("Okay sir, thanks.", allow_interruptions=True, wait=True, lifecycle="max_call_duration_watchdog")
+                else:
+                    logger.info("[WAITING_FOR_USER] turn_id=%s source=max_call_duration_no_reply", agent.current_turn_id)
             except Exception:
                 pass
             try:
@@ -1728,6 +1819,7 @@ async def entrypoint(ctx: JobContext):
             content = " ".join(str(c) for c in content if isinstance(c, str))
         text = str(content or "").strip()
         if text:
+            agent.note_external_assistant_response(source="conversation_item_added")
             asyncio.create_task(_log_transcript("assistant", text))
 
     @session.on("agent_speech_started")
@@ -1762,7 +1854,8 @@ async def entrypoint(ctx: JobContext):
             return
         if not transcript or len(transcript) < 3:
             return
-        if transcript_lower in filler_word_set:
+        agent.begin_committed_user_turn(transcript)
+        if transcript_lower in filler_word_set and not _is_soft_ack(transcript):
             logger.debug(f"[FILTER-FILLER] Dropped: '{transcript}'")
             return
 
@@ -1775,11 +1868,7 @@ async def entrypoint(ctx: JobContext):
         logger.info(f"[TRANSCRIPT] Turn {turn_count}/{max_turns}: '{transcript}'")
         if turn_count >= max_turns:
             logger.info(f"[LIMIT] Reached {max_turns} turns — wrapping up")
-            asyncio.create_task(
-                session.generate_reply(
-                    instructions="Politely wrap up: thank the caller, say they can call back anytime, and say a warm goodbye."
-                )
-            )
+            logger.info("[WAITING_FOR_USER] turn_id=%s source=max_turn_no_parallel_reply", agent.current_turn_id)
 
     @ctx.room.on("participant_disconnected")
     def on_participant_disconnected(participant):

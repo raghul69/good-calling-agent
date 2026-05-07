@@ -16,8 +16,10 @@ from livekit.agents import (
     llm,
 )
 from livekit.plugins import openai
+from backend.tracing import log_langsmith_status_once, trace_event
 
 logger = logging.getLogger("outbound-agent.llm_streamer")
+log_langsmith_status_once()
 
 GROQ_COOLDOWN_SECONDS = 60
 _groq_cooldown_until = 0.0
@@ -84,6 +86,14 @@ class FallbackLLMStream(llm.LLMStream):
                         chunk.usage.total_tokens,
                         chunk.usage.prompt_cached_tokens,
                     )
+                    trace_event(
+                        "groq_response",
+                        provider=self._owner.active_provider,
+                        model=self._owner.active_model,
+                        prompt_tokens=chunk.usage.prompt_tokens,
+                        completion_tokens=chunk.usage.completion_tokens,
+                        total_tokens=chunk.usage.total_tokens,
+                    )
                 self._event_ch.send_nowait(chunk)
 
     def _send_local_reply(self, text: str) -> None:
@@ -104,6 +114,12 @@ class FallbackLLMStream(llm.LLMStream):
 
         self._owner.active_provider = "groq"
         self._owner.active_model = self._owner.primary_model
+        trace_event(
+            "llm_call_start",
+            provider="groq",
+            model=self._owner.primary_model,
+            tool_count=len(self._tools or []),
+        )
         primary_conn = APIConnectOptions(
             max_retry=0,
             retry_interval=self._conn_options.retry_interval,

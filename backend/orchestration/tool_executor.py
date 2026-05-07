@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 from typing import Any
+from backend.tracing import sanitize_for_trace, trace_event
 
 logger = logging.getLogger("outbound-agent.orchestration.tools")
 
@@ -65,13 +66,21 @@ class ToolExecutor:
 
     async def execute(self, tool_id: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
         tid = (tool_id or "").strip()
+        trace_event("tool_execution_start", tool_id=tid, payload=sanitize_for_trace(payload or {}))
         if tid not in _EXEC_IDS:
-            return {"ok": False, "error": "unknown_tool", "tool_id": tid}
+            logger.info("[TRACE] tool_failure_continued tool_id=%s error=unknown_tool", tid)
+            result = {"ok": False, "error": "unknown_tool", "tool_id": tid}
+            trace_event("tool_failure_continued", tool_id=tid, error="unknown_tool")
+            return result
         if tid == "save_lead":
             fields = dict(payload or {})
             prior = dict(self.latest_lead) if isinstance(self.latest_lead, dict) else {}
             self.latest_lead = {**prior, **fields}
             logger.info("[SAVE_LEAD] captured_keys=%s", sorted(fields.keys()))
-            return {"ok": True, "tool_id": tid, "payload": fields}
+            result = {"ok": True, "tool_id": tid, "payload": fields}
+            trace_event("tool_execution_end", tool_id=tid, ok=True, payload=sanitize_for_trace(fields))
+            return result
         logger.info("[TOOL_EXEC] mock_execute tool_id=%s", tid)
-        return {"ok": True, "mocked": True, "tool_id": tid, "payload": payload or {}}
+        result = {"ok": True, "mocked": True, "tool_id": tid, "payload": payload or {}}
+        trace_event("tool_execution_end", tool_id=tid, ok=True)
+        return result

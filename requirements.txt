@@ -39,6 +39,8 @@ hyperframe==6.1.0
 idna==3.11
 importlib_metadata==8.7.1
 jiter==0.13.0
+langchain-core
+langsmith
 livekit==1.1.2
 livekit-agents==1.4.2
 livekit-api==1.1.0

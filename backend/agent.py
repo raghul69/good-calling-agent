@@ -394,6 +394,9 @@ from backend.latency_logger import VoiceLatencyLogger
 from backend.llm_streamer import build_voice_llm, groq_cooldown_active, groq_cooldown_remaining
 from backend.sarvam_streaming_stt import build_sarvam_stt
 from backend.sarvam_streaming_tts import build_sarvam_tts
+from backend.tracing import log_langsmith_status_once, log_tts_filter_blocked, trace_event
+
+log_langsmith_status_once()
 
 
 def _function_tool_id(tool_obj: Any) -> str:
@@ -713,6 +716,7 @@ class OutboundAssistant(Agent):
             self._natural_reply_pending_turn_id = None
             self._last_committed_user_norm = norm
             logger.info("[TURN_UNLOCKED] turn_id=%s transcript=%s", self.current_turn_id, str(text or "")[:120])
+            trace_event("user_transcript_received", turn_id=self.current_turn_id, transcript_len=len(text or ""))
         return self.current_turn_id
 
     def _can_send_for_current_turn(self, *, source: str) -> bool:
@@ -790,6 +794,8 @@ class OutboundAssistant(Agent):
         logger.info("[CONTROLLER_NO_OVERRIDE] turn_id=%s reason=%s", self.current_turn_id, reason)
         logger.info("[LIVEKIT_GROQ_MAIN_BRAIN] turn_id=%s reason=%s", self.current_turn_id, reason)
         logger.info("[LIVEKIT_NATURAL_REPLY_CALLED] turn_id=%s reason=%s", self.current_turn_id, reason)
+        logger.info("[TRACE] voice_graph_start turn_id=%s reason=%s", self.current_turn_id, reason)
+        trace_event("voice_graph_start", turn_id=self.current_turn_id, reason=reason, user_text_len=len(user_text or ""))
         try:
             self.response_sent_for_turn = True
             self.is_waiting_for_user = True
@@ -801,6 +807,8 @@ class OutboundAssistant(Agent):
             if turn_ctx is not None:
                 kwargs["chat_ctx"] = turn_ctx
             self.session.generate_reply(**kwargs)
+            logger.info("[TRACE] voice_graph_end turn_id=%s reason=%s", self.current_turn_id, reason)
+            trace_event("voice_graph_end", turn_id=self.current_turn_id, reason=reason, mode="livekit_generate_reply")
         except Exception as e:
             self.response_sent_for_turn = False
             self.is_waiting_for_user = False
@@ -821,11 +829,14 @@ class OutboundAssistant(Agent):
         text = _sanitize_tts_text(self._dedupe_reply(line))
         if not text:
             logger.info("[TTS_CHUNK_SKIPPED] reason=no_speakable_text")
+            log_tts_filter_blocked(source=lifecycle or "say_guarded", text=line, reason="no_speakable_text")
             return
         if lifecycle != "greeting" and not _is_valid_voice_response(text):
             logger.info("[FRAGMENT_BLOCKED] source=%s text=%s", lifecycle or "say_guarded", text[:120])
+            log_tts_filter_blocked(source=lifecycle or "say_guarded", text=text, reason="fragment_recovery")
             text = FRAGMENT_RECOVERY_LINE
         speak_start = time.perf_counter()
+        trace_event("sarvam_tts_reply_sent", source=lifecycle or "say_guarded", chars=len(text), words=len(text.split()))
         handle = self.session.say(text, allow_interruptions=allow_interruptions)
         publish_ms = _ms_since(speak_start)
         if lifecycle == "greeting":
@@ -908,9 +919,11 @@ class OutboundAssistant(Agent):
                     chunk = _sanitize_tts_text(chunk)
                     if not chunk:
                         logger.info("[TTS_CHUNK_SKIPPED] reason=no_speakable_text")
+                        log_tts_filter_blocked(source="livekit_tts_stream", text=buffer, reason="no_speakable_text")
                         continue
                     if not _is_valid_voice_response(chunk):
                         logger.info("[FRAGMENT_BLOCKED] source=livekit_tts_stream text=%s", chunk[:120])
+                        log_tts_filter_blocked(source="livekit_tts_stream", text=chunk, reason="fragment_recovery")
                         chunk = FRAGMENT_RECOVERY_LINE
                     chunk_count += 1
                     if not first_logged:
@@ -921,6 +934,7 @@ class OutboundAssistant(Agent):
                     logger.info("[TTS_TEXT_LENGTH] chunk=%s chars=%s words=%s", chunk_count, len(chunk), len(chunk.split()))
                     if len(chunk) > 120:
                         logger.warning("[TTS_TOO_LONG] chunk=%s chars=%s", chunk_count, len(chunk))
+                    trace_event("sarvam_tts_reply_sent", source="livekit_tts_stream", chars=len(chunk), words=len(chunk.split()))
                     yield chunk
                 buffer = ""
 
@@ -932,9 +946,11 @@ class OutboundAssistant(Agent):
                     chunk = _sanitize_tts_text(chunk)
                     if not chunk:
                         logger.info("[TTS_CHUNK_SKIPPED] reason=no_speakable_text")
+                        log_tts_filter_blocked(source="livekit_tts_stream", text=buffer, reason="no_speakable_text")
                         continue
                     if not _is_valid_voice_response(chunk):
                         logger.info("[FRAGMENT_BLOCKED] source=livekit_tts_stream text=%s", chunk[:120])
+                        log_tts_filter_blocked(source="livekit_tts_stream", text=chunk, reason="fragment_recovery")
                         chunk = FRAGMENT_RECOVERY_LINE
                     chunk_count += 1
                     if not first_logged:
@@ -947,6 +963,7 @@ class OutboundAssistant(Agent):
                     logger.info("[TTS_TEXT_LENGTH] chunk=%s chars=%s words=%s", chunk_count, len(chunk), len(chunk.split()))
                     if len(chunk) > 120:
                         logger.warning("[TTS_TOO_LONG] chunk=%s chars=%s", chunk_count, len(chunk))
+                    trace_event("sarvam_tts_reply_sent", source="livekit_tts_stream", chars=len(chunk), words=len(chunk.split()))
                     yield chunk
             if raw_total_len > 120:
                 logger.warning("[TTS_TOO_LONG] chars=%s", raw_total_len)
@@ -974,7 +991,12 @@ class OutboundAssistant(Agent):
             if execr is None:
                 msg = "This action isn't available yet."
             else:
-                res = await execr.execute(name, pl)
+                try:
+                    res = await execr.execute(name, pl)
+                except Exception as e:
+                    logger.info("[TRACE] tool_failure_continued tool_id=%s error=%s", name or "-", type(e).__name__)
+                    trace_event("tool_failure_continued", tool_id=name or "", error=type(e).__name__)
+                    res = {"ok": False, "error": type(e).__name__}
                 msg = "Done." if res.get("ok") else "Sorry, that didn't work."
         text = (msg if isinstance(msg, str) else str(msg))[:1200]
         await self._say_tool_guarded(_limit_voice_words(text, max_words=10), source=f"tool_{name or 'unknown'}")

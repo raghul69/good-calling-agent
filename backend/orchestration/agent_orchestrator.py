@@ -16,6 +16,7 @@ from backend.orchestration.packs.loan_collection_pack import normalize_loan_risk
 from backend.orchestration.schemas import AgentAction, AgentSessionState
 from backend.orchestration.state_store import OrchestrationStateStore
 from backend.orchestration.tool_executor import ToolExecutor
+from backend.tracing import sanitize_for_trace, trace_event
 from backend.orchestration.transfer_manager import TransferManager
 
 logger = logging.getLogger("outbound-agent.orchestration")
@@ -140,9 +141,21 @@ class AgentOrchestrator:
         keys = [k for k, v in fields.items() if v not in (None, "", [], {})]
         logger.info("[LEAD_EXTRACTED] call_id=%s keys=%s n=%s", self._call_id, ",".join(sorted(keys))[:300], len(keys))
 
+    def _trace_voice_graph_end(self, action: AgentAction) -> None:
+        logger.info("[TRACE] voice_graph_end call_id=%s action=%s", self._call_id, action.type)
+        trace_event("voice_graph_end", call_id=self._call_id, action=action.type, reason=action.reason or "")
+
     async def handle_user_message(self, text: str) -> AgentAction:
         t = (text or "").strip()
         logger.info("[ORCHESTRATOR] message_received call_id=%s len=%s", self._call_id, len(t))
+        logger.info("[SAFETY_ONLY_CONTROLLER] call_id=%s", self._call_id)
+        logger.info("[TRACE] voice_graph_start call_id=%s text_len=%s", self._call_id, len(t))
+        trace_event(
+            "voice_graph_start",
+            call_id=self._call_id,
+            text_len=len(t),
+            agent_id=sanitize_for_trace(self._agent_config.get("agent_id") or ""),
+        )
 
         self._append_transcript(t, "user")
 
@@ -150,6 +163,7 @@ class AgentOrchestrator:
             act = AgentAction(type="noop")
             self._log_selected(act)
             self._record_action(act)
+            self._trace_voice_graph_end(act)
             return act
 
         if _is_confusion(t):
@@ -163,6 +177,7 @@ class AgentOrchestrator:
             self._finalize_assistant_action(act)
             self._log_selected(act)
             self._record_action(act)
+            self._trace_voice_graph_end(act)
             return act
 
         # Guardrails first
@@ -170,6 +185,7 @@ class AgentOrchestrator:
             act = AgentAction(type="end_call", reason="caller_intent")
             self._log_selected(act)
             self._record_action(act)
+            self._trace_voice_graph_end(act)
             return act
 
         if self._detect_transfer_intent(t):
@@ -179,6 +195,7 @@ class AgentOrchestrator:
                 self._state.transfer_requested = True
                 self._log_selected(act)
                 self._record_action(act)
+                self._trace_voice_graph_end(act)
                 return act
             logger.info(
                 "[ORCHESTRATOR] transfer_intent_ignored allowed_tool=%s tm_ok=%s",
@@ -244,6 +261,7 @@ class AgentOrchestrator:
                 )
             self._log_selected(act)
             self._record_action(act)
+            self._trace_voice_graph_end(act)
             return act
 
         tool_act = self._select_tool(t)
@@ -251,18 +269,21 @@ class AgentOrchestrator:
             self._finalize_assistant_action(tool_act)
             self._log_selected(tool_act)
             self._record_action(tool_act)
+            self._trace_voice_graph_end(tool_act)
             return tool_act
 
         if self._detect_save_data_intent(t):
             act = AgentAction(type="save_data", reason="caller_intent", payload={"note": t[:500]})
             self._log_selected(act)
             self._record_action(act)
+            self._trace_voice_graph_end(act)
             return act
 
         act = AgentAction(type="speak")
         self._finalize_assistant_action(act)
         self._log_selected(act)
         self._record_action(act)
+        self._trace_voice_graph_end(act)
         return act
 
     def _finalize_assistant_action(self, action: AgentAction) -> None:

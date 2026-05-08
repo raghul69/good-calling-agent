@@ -122,7 +122,7 @@ typing-inspection==0.4.2
 typing_extensions==4.15.0
 uritemplate==4.2.0
 urllib3==2.6.3
-uvicorn==0.41.0
+uvicorn[standard]==0.41.0
 watchfiles==1.1.1
 websockets==15.0.1
 yarl==1.22.0

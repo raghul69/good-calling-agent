@@ -10,6 +10,7 @@ import secrets
 import hashlib
 import threading
 import time
+import importlib
 from contextlib import asynccontextmanager
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
@@ -34,17 +35,98 @@ import backend.db as db
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("backend-api")
+_SAFE_MODE_ENABLED = False
+_STARTUP_WARNINGS: list[str] = []
+
+
+def _startup_warning(component: str, exc: BaseException | str) -> None:
+    message = f"{component}:{type(exc).__name__ if isinstance(exc, BaseException) else exc}"
+    _STARTUP_WARNINGS.append(message)
+    logger.warning("[STARTUP_WARNING] component=%s detail=%s", component, type(exc).__name__ if isinstance(exc, BaseException) else exc)
+
+
+def _enable_safe_mode(reason: str) -> None:
+    global _SAFE_MODE_ENABLED
+    _SAFE_MODE_ENABLED = True
+    logger.warning("[SAFE_MODE_ENABLED] reason=%s", reason)
+
+
+def _optional_import(module_name: str, *, component: str) -> Any | None:
+    try:
+        module = importlib.import_module(module_name)
+        logger.info("[STARTUP_INIT] component=%s status=ok", component)
+        return module
+    except Exception as exc:
+        _startup_warning(component, exc)
+        _enable_safe_mode(f"{component}_import_failed")
+        return None
+
+
+def _safe_startup_probe(component: str, fn: Callable[[], Any], fallback: Any) -> Any:
+    try:
+        return fn()
+    except Exception as exc:
+        _startup_warning(component, exc)
+        _enable_safe_mode(f"{component}_probe_failed")
+        return fallback
+
+
+def _init_optional_saas_subsystems() -> None:
+    """Probe optional Phase 5 modules without letting them block API boot."""
+    optional = (
+        ("backend.tracing", "langsmith_tracing"),
+        ("backend.queue_manager", "queue_manager"),
+        ("backend.campaigns", "campaign_scheduler"),
+        ("backend.worker", "worker_safety"),
+    )
+    for module_name, component in optional:
+        module = _optional_import(module_name, component=component)
+        if module is None:
+            continue
+        try:
+            if component == "langsmith_tracing" and hasattr(module, "log_langsmith_status_once"):
+                module.log_langsmith_status_once()
+            elif component == "queue_manager" and hasattr(module, "AnalyticsAggregator"):
+                module.AnalyticsAggregator().summary()
+                if hasattr(module, "CostTracker"):
+                    module.CostTracker(warn_threshold_usd=9999).estimate(
+                        stt_seconds=0,
+                        tts_chars=0,
+                        llm_tokens=0,
+                        call_id="startup",
+                    )
+            elif component == "worker_safety" and hasattr(module, "WorkerSafetyLayer"):
+                module.WorkerSafetyLayer(worker_id="api-startup").heartbeat_once()
+        except Exception as exc:
+            _startup_warning(component, exc)
+            _enable_safe_mode(f"{component}_init_failed")
 
 
 @asynccontextmanager
 async def _app_lifespan(_app: FastAPI):
     retry_task: asyncio.Task | None = None
+    logger.info("[STARTUP_INIT] component=fastapi_lifespan status=starting")
+    try:
+        _init_optional_saas_subsystems()
+    except Exception as exc:
+        logger.exception("[STARTUP_FAILURE] component=optional_saas_init error=%s", type(exc).__name__)
+        _enable_safe_mode("optional_saas_init_failed")
     if os.environ.get("DISABLE_CALL_RETRY_SCHEDULER", "").lower() in {"1", "true", "yes"}:
         logger.info("Call retry scheduler disabled by env")
     else:
-        retry_task = asyncio.create_task(_retry_scheduler_loop())
+        try:
+            retry_task = asyncio.create_task(_retry_scheduler_loop())
+            logger.info("[STARTUP_INIT] component=call_retry_scheduler status=started")
+        except Exception as exc:
+            _startup_warning("call_retry_scheduler", exc)
+            _enable_safe_mode("call_retry_scheduler_failed")
 
-    await _log_deployment_integration()
+    try:
+        await asyncio.wait_for(_log_deployment_integration(), timeout=float(os.environ.get("STARTUP_PROBE_TIMEOUT_SECONDS", "8") or 8))
+        logger.info("[STARTUP_INIT] component=deployment_integration status=complete")
+    except Exception as exc:
+        logger.exception("[STARTUP_FAILURE] component=deployment_integration error=%s", type(exc).__name__)
+        _enable_safe_mode("deployment_integration_failed")
 
     try:
         yield
@@ -285,9 +367,9 @@ def health_check():
     import datetime
 
     _apply_config_env()
-    supabase_status = db.get_supabase_config_status()
-    agent_publish_schema = db.check_agent_publish_uuid_schema()
-    livekit_status = _livekit_config_status()
+    supabase_status = _safe_startup_probe("supabase_health", db.get_supabase_config_status, {"configured": False, "service_role_key_present": False})
+    agent_publish_schema = _safe_startup_probe("agent_publish_schema", db.check_agent_publish_uuid_schema, {"ok": False, "message": "safe_mode_probe_failed"})
+    livekit_status = _safe_startup_probe("livekit_config_health", _livekit_config_status, {"configured": False, "url_valid": False})
     mvp_keys = [
         "LIVEKIT_URL",
         "LIVEKIT_API_KEY",
@@ -323,6 +405,8 @@ def health_check():
         "voice_pipeline": os.environ.get("VOICE_PIPELINE", "livekit_agents"),
         "missing": missing,
         "status": "ok",
+        "safe_mode": _SAFE_MODE_ENABLED,
+        "startup_warnings": _STARTUP_WARNINGS[-10:],
         "timestamp": datetime.datetime.utcnow().isoformat(),
         "service": "rapidx-ai-voice-agent-api",
         # Keep these top-level flags for easier deployment checks.

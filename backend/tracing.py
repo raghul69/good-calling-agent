@@ -44,7 +44,7 @@ def log_langsmith_status_once() -> bool:
     global _LOGGED_STATUS
     enabled = configure_langsmith_env()
     if not _LOGGED_STATUS:
-        logger.info("[LANGSMITH] enabled=%s", str(enabled).lower())
+        logger.info("[LANGSMITH] enabled=%s project=%s", str(enabled).lower(), os.getenv("LANGCHAIN_PROJECT", "default"))
         _LOGGED_STATUS = True
     return enabled
 

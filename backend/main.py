@@ -37,6 +37,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("backend-api")
 _SAFE_MODE_ENABLED = False
 _STARTUP_WARNINGS: list[str] = []
+_CONTROLLED_SMOKE_TEST_LOCK = asyncio.Lock()
 
 
 def _startup_warning(component: str, exc: BaseException | str) -> None:
@@ -896,14 +897,7 @@ def _mask_phone_e164(phone: str) -> str:
 
 
 def _sip_failure_reason(exc: Exception) -> str:
-    failure_text = str(exc).lower()
-    if "busy" in failure_text:
-        return "busy"
-    if "timeout" in failure_text or "timed out" in failure_text:
-        return "timeout"
-    if "no answer" in failure_text or "no_answer" in failure_text:
-        return "no_answer"
-    return "sip_failure"
+    return str(db.classify_sip_failure(exc).get("normalized_reason") or "sip_failure")
 
 
 def _livekit_config_status() -> dict:
@@ -1252,6 +1246,18 @@ def _require_workspace_id(user: dict) -> str:
     if not workspace_id:
         raise HTTPException(status_code=400, detail="Workspace is required. Sign in again so a workspace can be created.")
     return workspace_id
+
+
+@app.get("/api/sip/debug/last-failures")
+def api_sip_debug_last_failures(
+    limit: int = Query(default=25, ge=1, le=100),
+    user: dict = Depends(_require_admin),
+):
+    """Admin/internal view of recent normalized SIP failures."""
+    return {
+        "items": db.fetch_last_sip_failures(limit=limit, workspace_id=user.get("_workspace_id")),
+        "limit": limit,
+    }
 
 
 def _is_uuid(value: str | None) -> bool:
@@ -1667,6 +1673,10 @@ def _internal_outbound_test_enabled() -> bool:
     return v in {"1", "true", "yes"}
 
 
+def _controlled_smoke_verified_phone() -> str:
+    return re.sub(r"[\s().-]+", "", (os.environ.get("CONTROLLED_SMOKE_TEST_PHONE") or "").strip())
+
+
 def _verify_internal_test_secret(header_value: str | None) -> None:
     # Intentionally return 404 when disabled/misconfigured to avoid advertising this route.
     enabled = _internal_outbound_test_enabled()
@@ -1679,6 +1689,21 @@ def _verify_internal_test_secret(header_value: str | None) -> None:
     secret_match = secrets.compare_digest(expected, provided)
     if not secret_match:
         raise HTTPException(status_code=401, detail="Invalid internal test secret")
+    logger.info("[TEST_MODE_ENABLED] controlled_smoke_test=true")
+
+
+def _verify_controlled_smoke_payload(payload: OutboundCallPayload) -> str:
+    phone = _validate_phone_number(payload.phone_number)
+    allowed_phone = _controlled_smoke_verified_phone()
+    if not allowed_phone:
+        raise HTTPException(status_code=404, detail="Not found")
+    if not secrets.compare_digest(phone, allowed_phone):
+        logger.warning("[CONTROLLED_SMOKE_TEST] blocked_unverified_phone dest=%s", _mask_phone_e164(phone))
+        raise HTTPException(status_code=403, detail="This controlled smoke route is restricted to the verified test number.")
+    if not str(payload.published_agent_uuid or payload.agent_id or "").strip():
+        raise HTTPException(status_code=400, detail="published_agent_uuid is required for controlled smoke calls.")
+    logger.info("[CONTROLLED_SMOKE_TEST] verified_phone=%s", _mask_phone_e164(phone))
+    return phone
 
 
 @app.post("/api/calls/outbound-test")
@@ -1688,8 +1713,12 @@ async def api_calls_outbound_test(
 ):
     _apply_config_env()
     _verify_internal_test_secret(x_internal_test_secret)
+    if _CONTROLLED_SMOKE_TEST_LOCK.locked():
+        raise HTTPException(status_code=429, detail="Controlled smoke test already in progress. Concurrency is limited to 1.")
+    phone = _verify_controlled_smoke_payload(payload)
+    published_uuid = str(payload.published_agent_uuid or payload.agent_id or "").strip()
+    resolved_agent = _resolve_agent_runtime_for_call(published_uuid, None, strict=True)
     if not _sip_trunk_id():
-        phone = _validate_phone_number(payload.phone_number)
         started_at = datetime.now(timezone.utc).isoformat()
         db.save_call_log(
             phone=phone,
@@ -1704,7 +1733,9 @@ async def api_calls_outbound_test(
             status="failed",
             failure_reason="sip_failure",
             room_name="",
-            agent_id=payload.agent_id,
+            agent_id=published_uuid,
+            agent_version_id=(resolved_agent or {}).get("agent_version_id"),
+            published_agent_uuid=(resolved_agent or {}).get("agent_id"),
             started_at=started_at,
         )
         raise HTTPException(
@@ -1716,14 +1747,19 @@ async def api_calls_outbound_test(
         "email": "",
         "_workspace_id": None,
     }
-    return await _dispatch_outbound_call(
-        CallPayload(
-            phone_number=payload.phone_number,
-            agent_id=payload.agent_id,
-            first_line=payload.first_line,
-        ),
-        test_user,
-    )
+    async with _CONTROLLED_SMOKE_TEST_LOCK:
+        logger.info("[AUTH_BYPASS_ACTIVE] scope=controlled_outbound_test_route")
+        logger.info("[CONTROLLED_SMOKE_TEST] dispatching agent_id=%s dest=%s", published_uuid, _mask_phone_e164(phone))
+        return await _dispatch_outbound_call(
+            CallPayload(
+                phone_number=phone,
+                agent_id=published_uuid,
+                published_agent_uuid=published_uuid,
+                first_line=payload.first_line,
+            ),
+            test_user,
+            resolved_agent=resolved_agent,
+        )
 
 
 @app.post("/api/sip/test-call")
@@ -1799,9 +1835,24 @@ async def api_sip_test_call(payload: SipTestCallPayload, user: dict = Depends(_r
                 )
             )
         except Exception as e:
-            reason = _sip_failure_reason(e)
+            sip_failure = db.classify_sip_failure(e)
+            reason = str(sip_failure.get("normalized_reason") or "sip_failure")
+            if sip_failure.get("sip_status") == "480":
+                logger.warning(
+                    "[SIP_PROVIDER_FAILURE] status=480 trunk_id=%s destination=%s",
+                    trunk_id,
+                    phone,
+                )
             if db_call_id:
-                db.mark_call_failed(db_call_id, reason, retry_count=0, max_retries=db.MAX_CALL_RETRIES)
+                db.mark_sip_call_failed(
+                    db_call_id,
+                    sip_failure,
+                    retry_count=0,
+                    max_retries=db.MAX_CALL_RETRIES,
+                    retryable=db.call_retry_policy_enabled(user.get("_workspace_id")),
+                    trunk_id=trunk_id,
+                    destination=phone,
+                )
             logger.warning(
                 "SIP test dial failed room=%s trunk_id=%s dest=%s reason=%s error=%s",
                 room_name,
@@ -2167,6 +2218,16 @@ async def api_get_call_log_detail(call_log_id: str, user: dict = Depends(_requir
     if not row:
         raise HTTPException(status_code=404, detail="Call log not found")
     return row
+
+
+@app.get("/api/calls/{call_log_id}/debug-timeline")
+async def api_get_call_debug_timeline(call_log_id: str, user: dict = Depends(_require_admin)):
+    _apply_config_env()
+    workspace_id = _require_workspace_id(user)
+    payload = db.fetch_call_debug_timeline(call_log_id, workspace_id)
+    if not payload:
+        raise HTTPException(status_code=404, detail="Call log not found")
+    return payload
 
 
 @app.get("/api/stats")

@@ -14,9 +14,65 @@ from supabase import Client, ClientOptions, create_client
 logger = logging.getLogger("backend-db")
 _SUPABASE_HTTP_CLIENT: httpx.Client | None = None
 
-RETRYABLE_CALL_FAILURES = {"no_answer", "busy", "sip_failure", "timeout"}
+SIP_FAILURE_REASONS = {
+    "provider_temporarily_unavailable",
+    "callee_busy",
+    "trunk_not_found",
+    "sip_auth_or_permission",
+    "destination_unreachable_or_timeout",
+    "sip_failure",
+}
+RETRYABLE_CALL_FAILURES = {"provider_temporarily_unavailable"}
 MAX_CALL_RETRIES = int(os.getenv("MAX_CALL_RETRIES", "3") or 3)
 CALL_RETRY_DELAY_SECONDS = int(os.getenv("CALL_RETRY_DELAY_SECONDS", "300") or 300)
+
+
+def classify_sip_failure(error: Exception | str) -> Dict[str, Any]:
+    text = str(error or "")
+    low = text.lower()
+    sip_status = ""
+    status_match = (
+        re.search(r"sip[_\s-]*status[_\s-]*code['\"]?\s*[:=]\s*['\"]?(\d{3})", text, re.I)
+        or re.search(r"sip\s+status\s*:\s*(\d{3})", text, re.I)
+        or re.search(r"\b(401|403|404|480|486)\b", text)
+    )
+    if status_match:
+        sip_status = status_match.group(1)
+
+    if sip_status == "480" or ("480" in low and "temporarily unavailable" in low):
+        reason = "provider_temporarily_unavailable"
+        sip_status = sip_status or "480"
+    elif sip_status == "486" or ("486" in low and ("busy here" in low or "busy" in low)):
+        reason = "callee_busy"
+        sip_status = sip_status or "486"
+    elif (sip_status == "404" and "trunk" in low) or ("404" in low and "trunk not found" in low):
+        reason = "trunk_not_found"
+        sip_status = sip_status or "404"
+    elif sip_status in {"401", "403"} or re.search(r"\b(401|403)\b", low):
+        reason = "sip_auth_or_permission"
+        sip_status = sip_status or ("401" if "401" in low else "403")
+    elif "timeout" in low or "timed out" in low or "no answer" in low or "no_answer" in low:
+        reason = "destination_unreachable_or_timeout"
+    else:
+        reason = "sip_failure"
+
+    return {"sip_status": sip_status, "normalized_reason": reason}
+
+
+def call_retry_policy_enabled(workspace_id: str | None = None) -> bool:
+    if os.getenv("DISABLE_CALL_RETRY_SCHEDULER", "").lower() in {"1", "true", "yes"}:
+        return False
+    raw = os.getenv("CALL_RETRY_ENABLED", "")
+    if raw.lower() in {"0", "false", "no", "off"}:
+        return False
+    if workspace_id:
+        settings = get_workspace_settings(workspace_id)
+        value = settings.get("retry_enabled")
+        if value is None and isinstance(settings.get("calls"), dict):
+            value = settings["calls"].get("retry_enabled")
+        if value is not None:
+            return bool(value)
+    return True
 
 DEFAULT_WELCOME_MESSAGE = "Hello, this is your AI assistant. Can you hear me?"
 FALLBACK_FIRST_LINE = "ஹலோ sir, MAXR Consultancy ல இருந்து பேசுறேன். Chennai la property பார்க்கிறீங்களா?"
@@ -639,6 +695,58 @@ def update_call_log(call_id: Any, **fields: Any) -> Dict[str, Any]:
     }
 
 
+_CALL_LOG_COLUMNS_CACHE: set[str] | None = None
+
+
+def _call_log_columns() -> set[str]:
+    global _CALL_LOG_COLUMNS_CACHE
+    if _CALL_LOG_COLUMNS_CACHE is not None:
+        return _CALL_LOG_COLUMNS_CACHE
+    sb = get_supabase(service_role=True)
+    if not sb:
+        return set()
+    try:
+        res = (
+            sb.table("call_logs")
+            .select("*")
+            .limit(1)
+            .execute()
+        )
+        sample = (res.data or [{}])[0] if res.data else {}
+        _CALL_LOG_COLUMNS_CACHE = set(sample.keys())
+    except Exception:
+        _CALL_LOG_COLUMNS_CACHE = set()
+    return _CALL_LOG_COLUMNS_CACHE
+
+
+def update_call_quality_fields(call_id: Any, **fields: Any) -> Dict[str, Any]:
+    allowed = {
+        "connected_at",
+        "first_audio_at",
+        "first_user_audio_at",
+        "first_stt_at",
+        "first_ai_reply_at",
+        "silence_detected",
+        "audio_issue_reason",
+    }
+    clean = {k: v for k, v in fields.items() if k in allowed and v is not None}
+    if not call_id or not clean:
+        return {"success": True, "skipped": True}
+    columns = _call_log_columns()
+    if columns:
+        clean = {k: v for k, v in clean.items() if k in columns}
+        if not clean:
+            return {"success": True, "skipped": True}
+    result = update_call_log(call_id, **clean)
+    if result.get("success"):
+        return result
+    message = str(result.get("message") or "").lower()
+    if "column" in message or "schema" in message or "cache" in message:
+        logger.info("[CALL_QUALITY_UPDATE_SKIPPED] id=%s fields=%s reason=missing_optional_columns", call_id, list(clean.keys()))
+        return {"success": True, "skipped": True, "message": result.get("message")}
+    return result
+
+
 def mark_call_answered(call_id: Any, room_name: str = "") -> Dict[str, Any]:
     return update_call_log(
         call_id,
@@ -662,7 +770,10 @@ def mark_call_failed(
 ) -> Dict[str, Any]:
     max_attempts = int(max_retries if max_retries is not None else MAX_CALL_RETRIES)
     next_count = int(retry_count or 0)
-    normalized_reason = reason if reason in RETRYABLE_CALL_FAILURES else "sip_failure"
+    normalized_reason = reason if reason in SIP_FAILURE_REASONS else "sip_failure"
+    if normalized_reason == "provider_temporarily_unavailable":
+        max_attempts = min(max_attempts, 1)
+        retryable = retryable and call_retry_policy_enabled()
     should_retry = retryable and normalized_reason in RETRYABLE_CALL_FAILURES and next_count < max_attempts
     next_retry_at = (
         (datetime.now(timezone.utc) + timedelta(seconds=CALL_RETRY_DELAY_SECONDS)).isoformat()
@@ -677,6 +788,82 @@ def mark_call_failed(
         max_retries=max_attempts,
         next_retry_at=next_retry_at,
     )
+
+
+def mark_sip_call_failed(
+    call_id: Any,
+    classification: Dict[str, Any],
+    *,
+    retry_count: int = 0,
+    max_retries: int | None = None,
+    retryable: bool = True,
+    trunk_id: str = "",
+    destination: str = "",
+) -> Dict[str, Any]:
+    reason = str(classification.get("normalized_reason") or "sip_failure")
+    result = mark_call_failed(
+        call_id,
+        reason,
+        retry_count=retry_count,
+        max_retries=max_retries,
+        retryable=retryable,
+    )
+    optional = {
+        "sip_status": str(classification.get("sip_status") or ""),
+        "sip_trunk_id": trunk_id or "",
+        "phone_number": destination or None,
+    }
+    optional = {k: v for k, v in optional.items() if v not in (None, "")}
+    if optional:
+        meta_result = update_call_log(call_id, **optional)
+        if not meta_result.get("success"):
+            logger.warning("[SIP_FAILURE_META_SAVE_SKIPPED] id=%s fields=%s", call_id, list(optional.keys()))
+    return result
+
+
+def _sip_status_for_reason(row: Dict[str, Any]) -> str:
+    raw = str(row.get("sip_status") or row.get("sip_status_code") or "").strip()
+    if raw:
+        return raw
+    return {
+        "provider_temporarily_unavailable": "480",
+        "callee_busy": "486",
+        "trunk_not_found": "404",
+        "sip_auth_or_permission": "401/403",
+    }.get(str(row.get("failure_reason") or ""), "")
+
+
+def fetch_last_sip_failures(limit: int = 25, workspace_id: str | None = None) -> List[Dict[str, Any]]:
+    sb = get_supabase(service_role=True)
+    if not sb:
+        return []
+    eff_limit = max(1, min(int(limit or 25), 100))
+    try:
+        query = sb.table("call_logs").select("*").order("created_at", desc=True).limit(eff_limit)
+        if workspace_id:
+            query = query.eq("workspace_id", workspace_id)
+        query = query.or_("status.eq.failed,status.eq.retry_scheduled,and(failure_reason.not.is.null,failure_reason.neq.)")
+        res = query.execute()
+        rows = []
+        for row in res.data or []:
+            reason = str(row.get("failure_reason") or "")
+            if reason and reason not in SIP_FAILURE_REASONS:
+                continue
+            rows.append(
+                {
+                    "call_id": row.get("id"),
+                    "destination": row.get("phone_number") or row.get("phone") or "",
+                    "trunk_id": row.get("sip_trunk_id") or row.get("trunk_id") or "",
+                    "sip_status": _sip_status_for_reason(row),
+                    "normalized_reason": reason,
+                    "room_name": row.get("room_name") or "",
+                    "created_at": row.get("created_at"),
+                }
+            )
+        return rows
+    except Exception as e:
+        logger.error(f"Failed to fetch SIP failures: {_friendly_supabase_error('Fetch SIP failures', e)}")
+        return []
 
 
 def claim_due_call_retries(limit: int = 5) -> List[Dict[str, Any]]:
@@ -1648,6 +1835,41 @@ def fetch_call_log_detail(call_log_id: Any, workspace_id: str) -> Dict[str, Any]
     except Exception as e:
         logger.warning(f"fetch_call_log_detail: {e}")
         return None
+
+
+def fetch_call_debug_timeline(call_log_id: Any, workspace_id: str) -> Dict[str, Any] | None:
+    row = fetch_call_log_detail(call_log_id, workspace_id)
+    if not row:
+        return None
+
+    def _event(name: str, ts: Any, **extra: Any) -> Dict[str, Any]:
+        item = {"event": name, "at": ts}
+        item.update({k: v for k, v in extra.items() if v not in (None, "")})
+        return item
+
+    timeline = [
+        _event("dispatch_created", row.get("created_at")),
+        _event("sip_invite_sent", row.get("started_at") or row.get("created_at")),
+        _event("connected", row.get("connected_at")),
+        _event("agent_joined", row.get("connected_at")),
+        _event("first_tts", row.get("first_audio_at")),
+        _event("first_user_audio", row.get("first_user_audio_at")),
+        _event("first_stt", row.get("first_stt_at")),
+        _event("first_ai_reply", row.get("first_ai_reply_at")),
+        _event("call_ended", row.get("updated_at"), status=row.get("status"), duration=row.get("duration")),
+    ]
+    reason = row.get("audio_issue_reason") or row.get("failure_reason")
+    if reason:
+        timeline.append(_event("failure_or_silence_reason", row.get("updated_at") or row.get("created_at"), reason=reason))
+    return {
+        "call_id": row.get("id"),
+        "room_name": row.get("room_name") or "",
+        "status": row.get("status") or "",
+        "failure_reason": row.get("failure_reason") or "",
+        "silence_detected": bool(row.get("silence_detected")),
+        "audio_issue_reason": row.get("audio_issue_reason") or "",
+        "timeline": timeline,
+    }
 
 
 def set_manual_disposition(call_log_id: Any, workspace_id: str, user_id: str | None, disposition: str) -> Dict[str, Any]:

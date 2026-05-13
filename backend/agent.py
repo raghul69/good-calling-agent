@@ -8,7 +8,7 @@ import asyncio
 import time
 import hashlib
 from collections import defaultdict
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
 from typing import Annotated, Any, AsyncIterable
 
@@ -38,6 +38,7 @@ FALLBACK_FIRST_LINE = "ஹலோ sir, MAXR Consultancy ல இருந்து
 logging.basicConfig(level=logging.INFO)
 _PROCESS_STARTED_MONO = time.perf_counter()
 _FIRST_LIVEKIT_JOB_SEEN = False
+_ACTIVE_ROOM_NAMES: set[str] = set()
 
 # Duplicate tool call_id grouping bug (livekit-agents) — must run before livekit.agents imports
 try:
@@ -173,7 +174,14 @@ _EXIT_INTENT_RE = re.compile(
     r"\b(thank\s*you|thanks|bye|goodbye|cut|cut\s+call|go\s+home|not\s+interested|vendam|venam|podhum)\b",
     re.IGNORECASE,
 )
-FRAGMENT_RECOVERY_LINE = "Sorry sir, voice konjam break aagudhu."
+FRAGMENT_RECOVERY_LINE = "Voice konjam cut aagudhu sir."
+GROQ_COOLDOWN_RECOVERY_LINE = "Konjam slow-ah sollunga sir, naan help pannuren."
+ALLOWED_FALLBACK_LINES = {
+    "Konjam clear-ah solreengala sir?",
+    "Voice konjam cut aagudhu sir.",
+    "Okay sir continue pannunga.",
+    GROQ_COOLDOWN_RECOVERY_LINE,
+}
 
 
 def _split_sentences(text: str) -> list[str]:
@@ -213,21 +221,36 @@ def _is_exit_intent(text: str) -> bool:
     return bool(_EXIT_INTENT_RE.search(_normalize_voice_text(text)))
 
 
+def _is_weak_transcript(text: str) -> bool:
+    low = _normalize_voice_text(text)
+    if not low:
+        return True
+    if low in {"uh", "um", "hmm", "mmm", "ah", "aa", "noise"}:
+        return True
+    return len(low) <= 2 and low not in {"ok", "no"}
+
+
 def _is_valid_voice_response(text: str) -> bool:
     cleaned = _sanitize_tts_text(text)
     if not cleaned:
         return False
-    words = [w for w in re.split(r"\s+", _normalize_voice_text(cleaned)) if len(w) > 1]
-    if len(words) < 4:
+    low_raw = str(cleaned or "").strip().lower()
+    low_norm = _normalize_voice_text(cleaned)
+    if "system busy" in low_raw:
+        return False
+    if re.search(r"\b(function|tool_call|arguments|json|traceback|exception|api_key|secret|service_role)\b", low_raw):
+        return False
+    if re.search(r"^\s*[\{\[]", cleaned):
+        return False
+    if "sorry sorry" in low_norm or "apologize apologize" in low_norm:
         return False
     blocked = {
         "maxr",
         "hello sir voice",
         "seri sir vera",
         "sorry sir simple",
-        "okay sir",
     }
-    return _normalize_voice_text(cleaned) not in blocked
+    return low_norm not in blocked
 
 
 def _limit_voice_words(text: str, max_words: int = 12) -> str:
@@ -614,14 +637,30 @@ class OutboundAssistant(Agent):
         self._last_committed_user_norm = ""
         self._natural_reply_pending_turn_id: int | None = None
         self._high_confidence_intents_used: set[str] = set()
+        self._last_fallback_at = 0.0
+        self._fallback_count = 0
+        self._interruption_count = 0
+        self._response_latency_samples: list[int] = []
+        self._turn_started_at_mono = time.perf_counter()
+        self._current_reply_id = ""
+        self._agent_is_speaking = False
+        self._weak_stt_count = 0
+        self._silence_recovery_count = 0
+        self._last_interrupted_intent = ""
+        self._clarification_loop_count = 0
         live_config_loaded = self._live_config
         self._response_timeout_s = float(live_config_loaded.get("response_timeout_seconds") or 1.2)
         self._fast_pipeline_enabled = (
-            str(live_config_loaded.get("vertical") or "").strip().lower() == "tamil_real_estate"
+            str(live_config_loaded.get("vertical") or "").strip().lower() in {"tamil_real_estate", "real_estate"}
             or str(live_config_loaded.get("response_latency_mode") or "").strip().lower() == "fast"
         )
         logger.info("[HYBRID_NATURAL_MODE] livekit_groq_main=true controller_guard_only=true fast_router_high_confidence_only=true")
         self._fast_router = FastVoiceRouter()
+        logger.info("[CALL_STAGE] current=%s previous=- changed=true reason=agent_init", self._fast_router.state.current_stage)
+        self._fast_router.state.call_isolation_ok(
+            room_name=str(live_config_loaded.get("room_name") or live_config_loaded.get("roomName") or ""),
+            agent_id=str(live_config_loaded.get("agent_id") or ""),
+        )
         self._active_response_task: asyncio.Task[Any] | None = None
         self._barge_in = BargeInController()
         self._voice_latency = VoiceLatencyLogger(call_id=str(live_config_loaded.get("call_id") or ""))
@@ -689,17 +728,165 @@ class OutboundAssistant(Agent):
 
     def _fallback_recovery_line(self, user_text: str = "") -> str:
         self._confusion_count += 1
+        low = _normalize_voice_text(user_text)
+        if re.search(r"\b(ok|okay|seri|continue|yes)\b", low):
+            return "Okay sir continue pannunga."
+        if _is_confused_user(user_text):
+            return "Konjam clear-ah solreengala sir?"
         return FRAGMENT_RECOVERY_LINE
+
+    def _fallback_allowed(self, *, reason: str) -> bool:
+        now = time.monotonic()
+        if now - self._last_fallback_at < 8.0:
+            logger.info("[FALLBACK_SKIPPED] reason=%s cooldown_seconds=8", reason)
+            self._safety_guard(reason="fallback_cooldown", action="skip_repeat")
+            return False
+        self._last_fallback_at = now
+        self._fallback_count += 1
+        self._fallback_hierarchy(reason=reason, action="short_tamil_recovery")
+        logger.info("[VOICE_STATE] fallback_count=%s interruption_count=%s", self._fallback_count, self._interruption_count)
+        return True
+
+    def _avg_response_latency_ms(self) -> int:
+        return int(sum(self._response_latency_samples) / max(1, len(self._response_latency_samples))) if self._response_latency_samples else 0
+
+    def _adaptive_reply(self, line: str, *, lifecycle: str = "") -> str:
+        text = str(line or "").strip()
+        avg_ms = self._avg_response_latency_ms()
+        if lifecycle == "greeting" or avg_ms <= 1500 or len(text.split()) <= 10:
+            return text
+        lead = "சரி சார்..." if self._fast_router.state.current_stage != "qualification" else "ஒரு விஷயம் மட்டும் கேட்கிறேன்..."
+        shortened = _limit_voice_words(text, max_words=8)
+        reply = lead if not shortened else f"{lead} {shortened}"
+        logger.info("[ADAPTIVE_REPLY] avg_latency_ms=%s lifecycle=%s original_words=%s reply_words=%s", avg_ms, lifecycle or "-", len(text.split()), len(reply.split()))
+        return reply
+
+    def _fallback_hierarchy(self, *, reason: str, action: str) -> str:
+        phrase = "Konjam clear-ah solreengala sir?"
+        if reason in {"llm_slow", "groq_cooldown", "network_jitter"}:
+            phrase = "சரி சார்..."
+        elif reason in {"tts_filter", "tts_stream_filter", "tts_say_failed", "tts_playout_failed"}:
+            phrase = "Voice konjam cut aagudhu sir."
+        elif reason in {"tool_timeout", "tool_failure"}:
+            phrase = "Okay sir continue pannunga."
+        logger.info("[FALLBACK_HIERARCHY] reason=%s action=%s phrase=%s", reason, action, phrase)
+        return phrase
+
+    def _safety_guard(self, *, reason: str, action: str) -> bool:
+        state = self._fast_router.state
+        triggered = (
+            self._fallback_count >= 4
+            or state.repeated_question_count >= 3
+            or self._clarification_loop_count >= 3
+            or state.invalid_stage_jump_count >= 2
+        )
+        if triggered or reason:
+            logger.info(
+                "[SAFETY_GUARD_TRIGGERED] reason=%s action=%s fallback_count=%s duplicate_question_blocks=%s clarification_loops=%s invalid_stage_jumps=%s",
+                reason,
+                action,
+                self._fallback_count,
+                state.repeated_question_count,
+                self._clarification_loop_count,
+                state.invalid_stage_jump_count,
+            )
+        return triggered
+
+    def _infer_call_stage(self, text: str, intent: str = "") -> str:
+        low = _normalize_voice_text(text)
+        if intent in {"wrong_number", "cut_call"} or _is_exit_intent(low):
+            return "closing"
+        if intent in {"fallback_unclear_audio"} or _is_weak_transcript(text):
+            return "clarification"
+        if re.search(r"\b(price|cost|rate|evlo|evalo|amount|not interested|vendam|venam|busy|later)\b", low):
+            return "objection_handling"
+        if re.search(r"\b(transfer|manager|human|person)\b", low):
+            return "transfer_ready"
+        if re.search(r"\b(site visit|appointment|schedule|tomorrow|today|weekend|time|date)\b", low):
+            return "scheduling"
+        if low:
+            return "qualification"
+        return self._fast_router.state.current_stage
+
+    def _transition_call_stage(self, next_stage: str, *, reason: str) -> None:
+        self._fast_router.state.transition_call_stage(next_stage, reason=reason)  # type: ignore[arg-type]
+
+    def _remember_turn(self, *, role: str, text: str, intent: str = "") -> None:
+        state = self._fast_router.state
+        state.remember_turn(role=role, text=text, intent=intent)
+        low = _normalize_voice_text(text)
+        if role == "user" and re.search(r"\b(not interested|busy|later|price|cost|too much|vendam|venam)\b", low):
+            state.objections.append(str(text or "").strip()[:120])
+            state.objections = state.objections[-5:]
+
+    def _interruption_recovery(self, *, latest_text: str, intent: str = "") -> None:
+        self._last_interrupted_intent = intent or self._fast_router.state.last_user_intent or "user_barge_in"
+        self._transition_call_stage("clarification", reason="interruption")
+        self._remember_turn(role="user", text=latest_text, intent=self._last_interrupted_intent)
+        logger.info(
+            "[INTERRUPTION_RECOVERY] turn_id=%s interrupted_intent=%s latest_text_len=%s last_question_key=%s",
+            self.current_turn_id,
+            self._last_interrupted_intent,
+            len(str(latest_text or "")),
+            self._fast_router.state.last_question_key or "-",
+        )
+
+    def _silence_recovery_prompt(self) -> str:
+        self._silence_recovery_count += 1
+        self._fast_router.state.silence_count += 1
+        self._transition_call_stage("clarification", reason="silence_recovery")
+        if self._silence_recovery_count == 1:
+            prompt = "சார், கேட்கிறீர்களா?"
+        elif self._silence_recovery_count == 2:
+            prompt = "லைனில் இருக்கிறீர்களா?"
+        else:
+            prompt = "Okay sir, thanks."
+            self._transition_call_stage("closing", reason="silence_limit")
+        logger.info("[SILENCE_RECOVERY] count=%s prompt=%s", self._silence_recovery_count, prompt)
+        if self._silence_recovery_count >= 3:
+            self._safety_guard(reason="silence_limit", action="graceful_close")
+        return prompt
+
+    def _call_summary_log(self, *, duration_seconds: int, language_mode: str = "") -> None:
+        avg_ms = self._avg_response_latency_ms()
+        logger.info(
+            "[CALL_SUMMARY] avg_latency_ms=%s interruption_count=%s weak_stt_count=%s fallback_count=%s duplicate_question_blocks=%s silence_recoveries=%s language_mode=%s total_call_duration=%s current_stage=%s",
+            avg_ms,
+            self._barge_in.interrupt_count,
+            self._weak_stt_count,
+            self._fallback_count,
+            self._fast_router.state.repeated_question_count,
+            self._silence_recovery_count,
+            language_mode or self._fast_router.state.language_preference or "-",
+            duration_seconds,
+            self._fast_router.state.current_stage,
+        )
 
     def _dedupe_reply(self, line: str) -> str:
         cleaned = re.sub(r"\s+", " ", str(line or "")).strip()
         norm = _normalize_voice_text(cleaned)
         if not norm:
             return ""
+        question_key = FastVoiceRouter._question_key(cleaned, "")
+        if _is_question_like(cleaned) and question_key:
+            if question_key in self._fast_router.state.asked_questions:
+                self._fast_router.state.repeated_question_count += 1
+                logger.info(
+                    "[DUPLICATE_QUESTION_BLOCKED] key=%s count=%s source=agent",
+                    question_key,
+                    self._fast_router.state.repeated_question_count,
+                )
+                self._safety_guard(reason="duplicate_question", action="bridge_phrase")
+                cleaned = "Okay sir continue pannunga."
+                norm = _normalize_voice_text(cleaned)
+                question_key = ""
+            else:
+                self._fast_router.state.asked_questions.add(question_key)
         duplicate_response = norm == self._last_assistant_norm
         duplicate_question = _is_question_like(cleaned) and norm in self._recent_question_norms
         if duplicate_response or duplicate_question:
             logger.info("[DUPLICATE_BLOCKED] duplicate_response=%s duplicate_question=%s text=%s", duplicate_response, duplicate_question, cleaned[:120])
+            self._safety_guard(reason="duplicate_reply", action="suppress")
             return ""
         self._last_assistant_norm = norm
         if _is_question_like(cleaned):
@@ -711,10 +898,13 @@ class OutboundAssistant(Agent):
         norm = _normalize_voice_text(text)
         if norm and norm != self._last_committed_user_norm:
             self.current_turn_id += 1
+            self._turn_started_at_mono = time.perf_counter()
             self.response_sent_for_turn = False
             self.is_waiting_for_user = False
             self._natural_reply_pending_turn_id = None
             self._last_committed_user_norm = norm
+            self._remember_turn(role="user", text=text, intent=self._fast_router.state.last_user_intent)
+            self._transition_call_stage(self._infer_call_stage(text, self._fast_router.state.last_user_intent), reason="user_turn")
             logger.info("[TURN_UNLOCKED] turn_id=%s transcript=%s", self.current_turn_id, str(text or "")[:120])
             trace_event("user_transcript_received", turn_id=self.current_turn_id, transcript_len=len(text or ""))
         return self.current_turn_id
@@ -766,13 +956,13 @@ class OutboundAssistant(Agent):
         if _is_exit_intent(low):
             return "Okay sir, thanks, call cut pannuren."
         if re.search(r"\b(hello+|helo+|hallo+|hi|hey)\b", low):
-            return "Hello sir."
+            return "Hello sir, voice clear-ah kekkudha?"
         if re.search(r"\b(repeat|again|once more|innoru thadava|marubadi|thirumba)\b", low):
             last = _limit_voice_words(self._fast_router.state.last_agent_text or self._last_assistant_norm, max_words=12)
-            return last or "Sorry sir, one more time sollunga."
+            return last or GROQ_COOLDOWN_RECOVERY_LINE
         if _is_confused_user(low) or re.search(r"\b(not clear|speak properly|clear ah illa|puriyala|theriyala)\b", low):
-            return "Sorry sir, konjam clear-ah sollunga."
-        return "Sorry sir, system busy. Please repeat shortly."
+            return "Konjam clear-ah solreengala sir?"
+        return GROQ_COOLDOWN_RECOVERY_LINE
 
     async def _handle_groq_cooldown_turn(self, user_text: str) -> bool:
         if not groq_cooldown_active():
@@ -780,6 +970,13 @@ class OutboundAssistant(Agent):
         remaining = groq_cooldown_remaining()
         logger.warning("[GROQ_COOLDOWN_ACTIVE] turn_id=%s remaining_seconds=%s", self.current_turn_id, remaining)
         reply = self._local_cooldown_reply(user_text)
+        if reply in ALLOWED_FALLBACK_LINES:
+            if self._fallback_allowed(reason="groq_cooldown"):
+                self._fallback_hierarchy(reason="groq_cooldown", action="local_short_reply")
+            else:
+                logger.info("[FALLBACK_TEXT_USED] turn_id=%s reason=groq_cooldown_guard_bypassed_for_audio text=%s", self.current_turn_id, reply[:120])
+        logger.info("[LLM_FALLBACK_PROVIDER] provider=local_tamil_safe reason=groq_cooldown turn_id=%s", self.current_turn_id)
+        logger.info("[FALLBACK_TEXT_USED] turn_id=%s reason=groq_cooldown text=%s", self.current_turn_id, reply[:120])
         logger.info("[LOCAL_REPLY_USED] turn_id=%s reason=groq_cooldown text=%s", self.current_turn_id, reply[:80])
         await self._say_guarded(reply, allow_interruptions=True, wait=True, lifecycle="groq_cooldown")
         if _is_exit_intent(user_text):
@@ -806,13 +1003,20 @@ class OutboundAssistant(Agent):
             }
             if turn_ctx is not None:
                 kwargs["chat_ctx"] = turn_ctx
+            self._current_reply_id = f"turn-{self.current_turn_id}-livekit-{int(time.perf_counter() * 1000)}"
             self.session.generate_reply(**kwargs)
+            self._log_turn_latency(
+                stage=self._fast_router.state.stage,
+                llm_first_token_ms=0,
+                total_response_ms=_ms_since(self._turn_started_at_mono),
+            )
             logger.info("[TRACE] voice_graph_end turn_id=%s reason=%s", self.current_turn_id, reason)
             trace_event("voice_graph_end", turn_id=self.current_turn_id, reason=reason, mode="livekit_generate_reply")
         except Exception as e:
             self.response_sent_for_turn = False
             self.is_waiting_for_user = False
             self._natural_reply_pending_turn_id = None
+            logger.info("[RECOVERY_PATH] source=groq_generate_reply action=continue_with_fallback error=%s", type(e).__name__)
             logger.exception("[LIVEKIT_NATURAL_REPLY_FAILED] turn_id=%s reason=%s exception=%s", self.current_turn_id, reason, e)
             raise
 
@@ -827,6 +1031,11 @@ class OutboundAssistant(Agent):
         if lifecycle != "greeting" and not self._can_send_for_current_turn(source=lifecycle or "say_guarded"):
             return
         text = _sanitize_tts_text(self._dedupe_reply(line))
+        text = self._adaptive_reply(text, lifecycle=lifecycle)
+        fallback_used = lifecycle in {"weak_stt", "groq_cooldown"} or str(line or "").strip() in ALLOWED_FALLBACK_LINES
+        if lifecycle == "groq_cooldown" and not text:
+            text = GROQ_COOLDOWN_RECOVERY_LINE
+            logger.info("[FALLBACK_TEXT_USED] turn_id=%s reason=dedupe_empty text=%s", self.current_turn_id, text)
         if not text:
             logger.info("[TTS_CHUNK_SKIPPED] reason=no_speakable_text")
             log_tts_filter_blocked(source=lifecycle or "say_guarded", text=line, reason="no_speakable_text")
@@ -834,20 +1043,98 @@ class OutboundAssistant(Agent):
         if lifecycle != "greeting" and not _is_valid_voice_response(text):
             logger.info("[FRAGMENT_BLOCKED] source=%s text=%s", lifecycle or "say_guarded", text[:120])
             log_tts_filter_blocked(source=lifecycle or "say_guarded", text=text, reason="fragment_recovery")
-            text = FRAGMENT_RECOVERY_LINE
+            if lifecycle == "groq_cooldown":
+                text = GROQ_COOLDOWN_RECOVERY_LINE
+                logger.info("[FALLBACK_TEXT_USED] turn_id=%s reason=filter_recovery text=%s", self.current_turn_id, text)
+                fallback_used = True
+            else:
+                if not self._fallback_allowed(reason="tts_filter"):
+                    return
+                text = FRAGMENT_RECOVERY_LINE
+                fallback_used = True
         speak_start = time.perf_counter()
+        self._current_reply_id = f"turn-{self.current_turn_id}-{int(speak_start * 1000)}"
+        live_config = getattr(self, "_live_config", {}) or {}
+        diag = live_config.get("_call_diagnostics") if isinstance(live_config, dict) else None
+        if isinstance(diag, ConnectedCallDiagnostics):
+            diag.mark_tts_started(str(live_config.get("tts_provider") or ""))
         trace_event("sarvam_tts_reply_sent", source=lifecycle or "say_guarded", chars=len(text), words=len(text.split()))
-        handle = self.session.say(text, allow_interruptions=allow_interruptions)
+        try:
+            handle = self.session.say(text, allow_interruptions=allow_interruptions)
+        except Exception as e:
+            self._fallback_hierarchy(reason="tts_say_failed", action="continue_without_dead_air")
+            logger.info("[RECOVERY_PATH] source=tts_say action=continue_without_dead_air error=%s", type(e).__name__)
+            log_tts_filter_blocked(source=lifecycle or "say_guarded", text=text, reason="tts_say_failed")
+            return
         publish_ms = _ms_since(speak_start)
+        logger.info("[TTS_FIRST_AUDIO] turn_id=%s ms=%s source=%s", self.current_turn_id, publish_ms, lifecycle or "say_guarded")
+        if isinstance(diag, ConnectedCallDiagnostics):
+            diag.mark_tts_audio_sent(len(text.encode("utf-8")), text_preview=text)
         if lifecycle == "greeting":
             logger.info("[FIRST_AUDIO_SENT] stage=greeting publish_ms=%s chars=%s", publish_ms, len(text))
         logger.info("[VOICE_LATENCY] stage=%s livekit_publish_ms=%s chars=%s", self._fast_router.state.stage, publish_ms, len(text))
-        self._voice_latency.log(stage=self._fast_router.state.stage, livekit_publish_ms=publish_ms)
+        total_response_ms = _ms_since(self._turn_started_at_mono)
+        fast_reply_used = lifecycle == "fast_router"
+        barge_in_used = self._barge_in.interrupt_count > 0
+        self._log_turn_latency(
+            stage=self._fast_router.state.stage,
+            stt_ms=self._fast_router.last_partial_ms,
+            router_ms=self._fast_router.last_router_ms,
+            tts_first_audio_ms=publish_ms,
+            livekit_publish_ms=publish_ms,
+            total_response_ms=total_response_ms,
+            fast_reply_used=fast_reply_used,
+            fallback_used=fallback_used,
+            barge_in_used=barge_in_used,
+        )
+        self._response_latency_samples.append(publish_ms)
+        avg_ms = int(sum(self._response_latency_samples) / max(1, len(self._response_latency_samples)))
+        logger.info(
+            "[VOICE_STATE] avg_response_latency_ms=%s interruption_count=%s fallback_count=%s fast_reply_used=%s fallback_used=%s barge_in_used=%s total_response_ms=%s",
+            avg_ms,
+            self._interruption_count,
+            self._fallback_count,
+            fast_reply_used,
+            fallback_used,
+            barge_in_used,
+            total_response_ms,
+        )
         self._fast_router.mark_agent_reply(text)
         if lifecycle != "greeting":
             self._mark_response_sent(source=lifecycle or "say_guarded")
         if wait:
-            await handle.wait_for_playout()
+            try:
+                await handle.wait_for_playout()
+            except asyncio.CancelledError:
+                logger.info("[ORPHAN_TASK_CLEANUP] current_reply_id=%s reason=playout_cancelled", self._current_reply_id or "-")
+                raise
+            except Exception as e:
+                self._fallback_hierarchy(reason="tts_playout_failed", action="continue_without_dead_air")
+                logger.info("[RECOVERY_PATH] source=tts_playout action=continue_without_dead_air error=%s", type(e).__name__)
+
+    def _log_turn_latency(self, **values: Any) -> None:
+        stt_ms = int(values.pop("stt_ms", 0) or 0)
+        values.setdefault("stt_final_ms", stt_ms)
+        values.setdefault("fast_reply_used", False)
+        values.setdefault("fallback_used", False)
+        values.setdefault("barge_in_used", self._barge_in.interrupt_count > 0)
+        values.setdefault("interruption_count", self._interruption_count)
+        values.setdefault("fallback_count", self._fallback_count)
+        self._voice_latency.log(**values)
+        logger.info(
+            "[TURN_LATENCY] stt_ms=%s llm_first_token_ms=%s tts_first_audio_ms=%s total_response_ms=%s fast_reply_used=%s fallback_used=%s barge_in_used=%s interruption_count=%s fallback_count=%s",
+            stt_ms,
+            int(values.get("llm_first_token_ms") or 0),
+            int(values.get("tts_first_audio_ms") or values.get("livekit_publish_ms") or 0),
+            int(values.get("total_response_ms") or values.get("total_first_audio_ms") or 0),
+            bool(values.get("fast_reply_used")),
+            bool(values.get("fallback_used")),
+            bool(values.get("barge_in_used")),
+            int(values.get("interruption_count") or 0),
+            int(values.get("fallback_count") or 0),
+        )
+        if int(values.get("total_response_ms") or values.get("total_first_audio_ms") or 0) > 1500:
+            self._fallback_hierarchy(reason="llm_slow", action="prefer_adaptive_short_reply")
 
     async def _say_tool_guarded(self, line: str, *, source: str = "tool_call") -> None:
         await self._say_guarded(line, allow_interruptions=True, wait=True, lifecycle=source)
@@ -855,10 +1142,29 @@ class OutboundAssistant(Agent):
     def handle_partial_transcript(self, text: str) -> None:
         if not self._fast_pipeline_enabled:
             return
+        low = _normalize_voice_text(text)
+        if self._agent_is_speaking and (_is_weak_transcript(text) or low in {"ok", "hm", "hmm", "mm"}):
+            logger.info("[BARGE_IN_IGNORED_NOISE] turn_id=%s text_len=%s", self.current_turn_id, len(str(text or "")))
+            return
         result = self._fast_router.note_partial(text)
-        if result.handled and result.confidence >= 0.9 and agent_is_speaking:
+        should_interrupt = self._agent_is_speaking and (
+            (result.handled and result.confidence >= 0.9)
+            or bool(_normalize_voice_text(text))
+        )
+        if should_interrupt:
             self._barge_in.note_user_speech(text)
-            self._barge_in.interrupt(self.session, self._active_response_task, reason=f"early_intent:{result.intent}")
+            self._fast_router.note_interruption()
+            self._interruption_count = self._barge_in.interrupt_count + 1
+            self._barge_in.interrupt(
+                self.session,
+                self._active_response_task,
+                reason=f"early_intent:{result.intent}",
+                room_name=str(self._live_config.get("room_name") or self._live_config.get("roomName") or ""),
+                agent_id=str(self._live_config.get("agent_id") or ""),
+                current_reply_id=self._current_reply_id,
+            )
+            self._interruption_recovery(latest_text=text, intent=result.intent or "")
+            logger.info("[BARGE_IN_RECOVERED] turn_id=%s latest_intent=%s", self.current_turn_id, result.intent or "-")
 
     async def on_enter(self):
         if self.greeting_sent:
@@ -888,6 +1194,7 @@ class OutboundAssistant(Agent):
             tts_start = time.perf_counter()
             chunk_count = 0
             first_logged = False
+            first_token_logged = False
             buffer = ""
             raw_total_len = 0
 
@@ -897,7 +1204,7 @@ class OutboundAssistant(Agent):
                     return False
                 if re.search(r"[।.!?]\s*$", stripped):
                     return True
-                return len(stripped.split()) >= 7
+                return len(stripped.split()) >= 5
 
             async for raw_chunk in text:
                 if self.current_turn_id > 0 and first_logged is False and not self._can_send_for_current_turn(source="livekit_natural_tts"):
@@ -905,6 +1212,9 @@ class OutboundAssistant(Agent):
                 raw_text = str(raw_chunk or "")
                 if not raw_text:
                     continue
+                if not first_token_logged and raw_text.strip():
+                    first_token_logged = True
+                    logger.info("[LLM_FIRST_TOKEN] turn_id=%s ms=%s", self.current_turn_id, _ms_since(tts_start))
                 raw_len = len(raw_text)
                 raw_total_len += raw_len
                 logger.info("[TTS_TEXT_LENGTH] chars=%s", raw_len)
@@ -924,13 +1234,23 @@ class OutboundAssistant(Agent):
                     if not _is_valid_voice_response(chunk):
                         logger.info("[FRAGMENT_BLOCKED] source=livekit_tts_stream text=%s", chunk[:120])
                         log_tts_filter_blocked(source="livekit_tts_stream", text=chunk, reason="fragment_recovery")
+                        if not self._fallback_allowed(reason="tts_stream_filter"):
+                            continue
                         chunk = FRAGMENT_RECOVERY_LINE
                     chunk_count += 1
                     if not first_logged:
                         first_logged = True
                         if self.current_turn_id > 0:
                             self._mark_response_sent(source="livekit_natural_tts")
-                        logger.info("[TTS_FIRST_CHUNK_MS] ms=%s chars=%s", _ms_since(tts_start), len(chunk))
+                        first_ms = _ms_since(tts_start)
+                        live_config = getattr(self, "_live_config", {}) or {}
+                        diag = live_config.get("_call_diagnostics") if isinstance(live_config, dict) else None
+                        if isinstance(diag, ConnectedCallDiagnostics):
+                            diag.mark_tts_started(str(live_config.get("tts_provider") or ""))
+                            diag.mark_tts_audio_sent(len(chunk.encode("utf-8")), text_preview=chunk)
+                        logger.info("[TTS_FIRST_CHUNK_MS] ms=%s chars=%s", first_ms, len(chunk))
+                        logger.info("[TTS_FIRST_AUDIO] turn_id=%s ms=%s source=livekit_tts_stream", self.current_turn_id, first_ms)
+                        logger.info("[STREAMING_RESPONSE] turn_id=%s first_chunk_words=%s", self.current_turn_id, len(chunk.split()))
                     logger.info("[TTS_TEXT_LENGTH] chunk=%s chars=%s words=%s", chunk_count, len(chunk), len(chunk.split()))
                     if len(chunk) > 120:
                         logger.warning("[TTS_TOO_LONG] chunk=%s chars=%s", chunk_count, len(chunk))
@@ -951,6 +1271,8 @@ class OutboundAssistant(Agent):
                     if not _is_valid_voice_response(chunk):
                         logger.info("[FRAGMENT_BLOCKED] source=livekit_tts_stream text=%s", chunk[:120])
                         log_tts_filter_blocked(source="livekit_tts_stream", text=chunk, reason="fragment_recovery")
+                        if not self._fallback_allowed(reason="tts_stream_filter"):
+                            continue
                         chunk = FRAGMENT_RECOVERY_LINE
                     chunk_count += 1
                     if not first_logged:
@@ -959,7 +1281,15 @@ class OutboundAssistant(Agent):
                             if not self._can_send_for_current_turn(source="livekit_natural_tts"):
                                 return
                             self._mark_response_sent(source="livekit_natural_tts")
-                        logger.info("[TTS_FIRST_CHUNK_MS] ms=%s chars=%s", _ms_since(tts_start), len(chunk))
+                        first_ms = _ms_since(tts_start)
+                        live_config = getattr(self, "_live_config", {}) or {}
+                        diag = live_config.get("_call_diagnostics") if isinstance(live_config, dict) else None
+                        if isinstance(diag, ConnectedCallDiagnostics):
+                            diag.mark_tts_started(str(live_config.get("tts_provider") or ""))
+                            diag.mark_tts_audio_sent(len(chunk.encode("utf-8")), text_preview=chunk)
+                        logger.info("[TTS_FIRST_CHUNK_MS] ms=%s chars=%s", first_ms, len(chunk))
+                        logger.info("[TTS_FIRST_AUDIO] turn_id=%s ms=%s source=livekit_tts_stream", self.current_turn_id, first_ms)
+                        logger.info("[STREAMING_RESPONSE] turn_id=%s first_chunk_words=%s", self.current_turn_id, len(chunk.split()))
                     logger.info("[TTS_TEXT_LENGTH] chunk=%s chars=%s words=%s", chunk_count, len(chunk), len(chunk.split()))
                     if len(chunk) > 120:
                         logger.warning("[TTS_TOO_LONG] chunk=%s chars=%s", chunk_count, len(chunk))
@@ -979,27 +1309,37 @@ class OutboundAssistant(Agent):
         name = (action.tool_name or "").strip()
         pl = action.payload or {}
         at = self._agent_tools
-        if name == "check_availability":
-            msg = await at.check_availability(pl.get("date") or "")
-        elif name == "get_business_hours":
-            msg = await at.get_business_hours()
-        elif name == "save_booking_intent":
-            await self._say_tool_guarded("Sure sir, preferred date and time sollunga.", source="tool_save_booking_intent")
-            return
-        else:
-            execr = self._tool_executor
-            if execr is None:
-                msg = "This action isn't available yet."
+        try:
+            if name == "check_availability":
+                msg = await asyncio.wait_for(at.check_availability(pl.get("date") or ""), timeout=2.0)
+            elif name == "get_business_hours":
+                msg = await asyncio.wait_for(at.get_business_hours(), timeout=2.0)
+            elif name == "save_booking_intent":
+                logger.info("[TOOL_EXEC] silent_route tool_id=%s", name)
+                return
             else:
-                try:
-                    res = await execr.execute(name, pl)
-                except Exception as e:
-                    logger.info("[TRACE] tool_failure_continued tool_id=%s error=%s", name or "-", type(e).__name__)
-                    trace_event("tool_failure_continued", tool_id=name or "", error=type(e).__name__)
-                    res = {"ok": False, "error": type(e).__name__}
-                msg = "Done." if res.get("ok") else "Sorry, that didn't work."
-        text = (msg if isinstance(msg, str) else str(msg))[:1200]
-        await self._say_tool_guarded(_limit_voice_words(text, max_words=10), source=f"tool_{name or 'unknown'}")
+                execr = self._tool_executor
+                if execr is None:
+                    msg = ""
+                else:
+                    res = await asyncio.wait_for(execr.execute(name, pl), timeout=2.0)
+                    msg = "Okay sir continue pannunga." if res.get("ok") else ""
+        except asyncio.TimeoutError:
+            logger.info("[TOOL_TIMEOUT_CONTINUED] tool_id=%s timeout_seconds=2", name or "-")
+            self._fallback_hierarchy(reason="tool_timeout", action="silent_continue")
+            logger.info("[RECOVERY_PATH] source=tool_timeout action=silent_continue tool_id=%s", name or "-")
+            trace_event("tool_timeout_continued", tool_id=name or "", timeout_seconds=2)
+            msg = ""
+        except Exception as e:
+            logger.info("[TRACE] tool_failure_continued tool_id=%s error=%s", name or "-", type(e).__name__)
+            self._fallback_hierarchy(reason="tool_failure", action="silent_continue")
+            logger.info("[RECOVERY_PATH] source=tool_failure action=silent_continue tool_id=%s error=%s", name or "-", type(e).__name__)
+            trace_event("tool_failure_continued", tool_id=name or "", error=type(e).__name__)
+            msg = ""
+        if msg:
+            text = _sanitize_tts_text(_limit_voice_words(str(msg), max_words=10))
+            if text and _is_valid_voice_response(text):
+                await self._say_tool_guarded(text, source=f"tool_{name or 'unknown'}")
 
     async def on_user_turn_completed(
         self,
@@ -1019,22 +1359,44 @@ class OutboundAssistant(Agent):
             logger.info("[DUPLICATE_BLOCKED] turn_id=%s source=on_user_turn_completed reason=locked_before_routing", self.current_turn_id)
             raise StopResponse()
         if _is_exit_intent(text):
+            self._transition_call_stage("closing", reason="exit_intent")
             logger.info("[EXIT_DETECTED] turn_id=%s text=%s", self.current_turn_id, text[:120])
             await self._say_guarded("Okay sir, thanks, call cut pannuren.", allow_interruptions=True, wait=True, lifecycle="exit_intent")
             self.conversation_ended = True
+            self._transition_call_stage("completed", reason="exit_intent")
+            raise StopResponse()
+        if _is_weak_transcript(text):
+            self._weak_stt_count += 1
+            self._silence_recovery_count += 1
+            self._clarification_loop_count += 1
+            self._transition_call_stage("clarification", reason="weak_stt")
+            logger.info("[WEAK_STT_CLARIFY] turn_id=%s text_len=%s", self.current_turn_id, len(text))
+            self._fallback_hierarchy(reason="weak_stt", action="clarify_short")
+            logger.info("[RECOVERY_PATH] source=weak_stt action=clarify_short")
+            if self._fallback_allowed(reason="weak_stt"):
+                await self._say_guarded("Konjam clear-ah solreengala sir?", allow_interruptions=True, wait=True, lifecycle="weak_stt")
             raise StopResponse()
         if _is_soft_ack(text):
             logger.info("[SOFT_ACK_DETECTED] turn_id=%s text=%s", self.current_turn_id, text[:120])
+            if self._fast_pipeline_enabled:
+                self._fast_router.start_turn()
+                fast_ack = self._fast_router.route_final(text)
+                if fast_ack.handled and fast_ack.message:
+                    self._transition_call_stage(self._infer_call_stage(text, fast_ack.intent or ""), reason=f"fast_ack:{fast_ack.intent or '-'}")
+                    await self._say_guarded(fast_ack.message, allow_interruptions=True, lifecycle="fast_router")
+                    raise StopResponse()
             await self._call_livekit_natural_reply(reason="soft_ack", turn_ctx=turn_ctx, user_text=text)
             raise StopResponse()
         if self._fast_pipeline_enabled:
             self._fast_router.start_turn()
             fast_action = self._fast_router.route_final(text)
             if fast_action.handled and fast_action.message and fast_action.confidence >= 0.9:
+                self._transition_call_stage(self._infer_call_stage(text, fast_action.intent or ""), reason=f"fast_router:{fast_action.intent or '-'}")
                 if self._is_repeated_high_confidence_intro(fast_action.intent or ""):
                     await self._call_livekit_natural_reply(reason="repeated_fast_router_intro", turn_ctx=turn_ctx, user_text=text)
                     raise StopResponse()
                 logger.info("[FAST_PIPELINE] emergency_override intent=%s stage=%s", fast_action.intent, fast_action.stage)
+                logger.info("[FAST_REPLY] turn_id=%s intent=%s", self.current_turn_id, fast_action.intent or "-")
                 logger.info("[FAST_ROUTER_HIGH_CONFIDENCE] turn_id=%s intent=%s confidence=%s", self.current_turn_id, fast_action.intent or "-", fast_action.confidence)
                 logger.info("[SAFETY_ONLY_CONTROLLER] turn_id=%s emergency_reply=true source=fast_router intent=%s", self.current_turn_id, fast_action.intent or "-")
                 self._voice_latency.log(
@@ -1045,6 +1407,7 @@ class OutboundAssistant(Agent):
                 await self._say_guarded(fast_action.message, allow_interruptions=True, lifecycle="fast_router")
                 if (fast_action.intent or "") in {"cut_call", "wrong_number"}:
                     self.conversation_ended = True
+                    self._transition_call_stage("completed", reason=f"fast_router:{fast_action.intent or '-'}")
                 raise StopResponse()
             logger.info(
                 "[FAST_ROUTER_LOW_CONFIDENCE_SKIPPED] turn_id=%s intent=%s confidence=%s handled=%s",
@@ -1083,9 +1446,30 @@ class CallLatencyTracker:
         self.turn_index = 0
         self.current_turn: dict[str, Any] | None = None
         self._last_user_speaking_end_wall: float | None = None
+        self._last_user_speaking_start_wall: float | None = None
+        self.latency_samples: list[int] = []
+
+    def mark_user_speaking_start(self, created_at: float | None = None) -> None:
+        self._last_user_speaking_start_wall = float(created_at or time.time())
 
     def mark_user_speaking_end(self, created_at: float | None = None) -> None:
-        self._last_user_speaking_end_wall = float(created_at or time.time())
+        ended_at = float(created_at or time.time())
+        self._last_user_speaking_end_wall = ended_at
+        speech_ms = 0
+        if self._last_user_speaking_start_wall:
+            speech_ms = max(0, int((ended_at - self._last_user_speaking_start_wall) * 1000))
+        silence_ms = 850
+        if speech_ms > 3500:
+            silence_ms = 1200
+        elif speech_ms < 900:
+            silence_ms = 650
+        logger.info(
+            "[ENDPOINTING] room=%s silence_ms=%s speech_duration_ms=%s interruptions=%s",
+            self.room_name,
+            silence_ms,
+            speech_ms,
+            0,
+        )
 
     def mark_final_transcript(self, transcript: str, created_at: float | None = None) -> None:
         self.turn_index += 1
@@ -1096,8 +1480,10 @@ class CallLatencyTracker:
             "final_transcript_wall": final_at,
             "final_transcript_mono": time.perf_counter(),
             "stt_ms": None,
+            "llm_queue_ms": None,
             "llm_first_token_ms": None,
             "llm_total_ms": None,
+            "tts_generation_ms": None,
             "tts_first_audio_ms": None,
             "tts_total_ms": None,
             "db_save_ms": None,
@@ -1106,6 +1492,7 @@ class CallLatencyTracker:
             stt_ms = max(0, int((final_at - self._last_user_speaking_end_wall) * 1000))
             self.current_turn["stt_ms"] = stt_ms
             logger.info("[STT_LATENCY_MS] room=%s turn=%s ms=%s source=user_state_to_final_transcript", self.room_name, self.turn_index, stt_ms)
+            logger.info("[STT_MS] room=%s turn=%s ms=%s source=user_state_to_final_transcript", self.room_name, self.turn_index, stt_ms)
             self._voice_latency.log(stage="stt_final", stt_final_ms=stt_ms)
         logger.info("[TURN_START] room=%s turn=%s transcript_chars=%s", self.room_name, self.turn_index, len(transcript or ""))
 
@@ -1123,8 +1510,11 @@ class CallLatencyTracker:
             turn["llm_first_token_ms"] = ms
             turn["llm_total_ms"] = ms
         logger.info("[LLM_FIRST_TOKEN_MS] room=%s turn=%s ms=%s source=orchestrator_non_streaming", self.room_name, turn_id, ms)
+        logger.info("[LLM_FIRST_TOKEN] room=%s turn=%s ms=%s source=orchestrator_non_streaming", self.room_name, turn_id, ms)
+        logger.info("[FIRST_AUDIO_MS] room=%s turn=%s ms=%s source=orchestrator_non_streaming", self.room_name, turn_id, ms)
         self._voice_latency.log(stage="llm", llm_first_token_ms=ms)
         logger.info("[LLM_TOTAL_MS] room=%s turn=%s ms=%s source=orchestrator", self.room_name, turn_id, ms)
+        logger.info("[LLM_MS] room=%s turn=%s ms=%s source=orchestrator", self.room_name, turn_id, ms)
 
     def note_agent_state(self, old_state: str, new_state: str, created_at: float | None = None) -> None:
         global agent_is_speaking
@@ -1149,6 +1539,7 @@ class CallLatencyTracker:
                 stt_ms,
                 int(float(getattr(metric, "end_of_utterance_delay", 0.0) or 0.0) * 1000),
             )
+            logger.info("[STT_MS] room=%s turn=%s ms=%s source=eou_metrics", self.room_name, turn_id, stt_ms)
             return
         if mtype == "stt_metrics":
             stt_ms = int(float(getattr(metric, "duration", 0.0) or 0.0) * 1000)
@@ -1160,16 +1551,20 @@ class CallLatencyTracker:
                 int(float(getattr(metric, "audio_duration", 0.0) or 0.0) * 1000),
                 bool(getattr(metric, "streamed", False)),
             )
+            logger.info("[STT_MS] room=%s turn=%s ms=%s source=stt_metrics", self.room_name, turn_id, stt_ms)
             return
         if mtype == "llm_metrics":
             first_ms = int(float(getattr(metric, "ttft", 0.0) or 0.0) * 1000)
             total_ms = int(float(getattr(metric, "duration", 0.0) or 0.0) * 1000)
             if turn is not None:
+                turn["llm_queue_ms"] = max(0, first_ms)
                 turn["llm_first_token_ms"] = first_ms
                 turn["llm_total_ms"] = total_ms
             logger.info("[LLM_FIRST_TOKEN_MS] room=%s turn=%s ms=%s speech_id=%s", self.room_name, turn_id, first_ms, getattr(metric, "speech_id", None) or "")
+            logger.info("[LLM_FIRST_TOKEN] room=%s turn=%s ms=%s speech_id=%s", self.room_name, turn_id, first_ms, getattr(metric, "speech_id", None) or "")
             self._voice_latency.log(stage="llm", llm_first_token_ms=first_ms)
             logger.info("[LLM_TOTAL_MS] room=%s turn=%s ms=%s tokens=%s", self.room_name, turn_id, total_ms, getattr(metric, "total_tokens", 0))
+            logger.info("[LLM_MS] room=%s turn=%s ms=%s first_token_ms=%s tokens=%s", self.room_name, turn_id, total_ms, first_ms, getattr(metric, "total_tokens", 0))
             logger.info(
                 "[LLM_REPLY_TOKENS] room=%s turn=%s prompt_tokens=%s completion_tokens=%s total_tokens=%s cached_tokens=%s",
                 self.room_name,
@@ -1184,11 +1579,15 @@ class CallLatencyTracker:
             first_ms = int(float(getattr(metric, "ttfb", 0.0) or 0.0) * 1000)
             total_ms = int(float(getattr(metric, "duration", 0.0) or 0.0) * 1000)
             if turn is not None:
+                turn["tts_generation_ms"] = total_ms
                 turn["tts_first_audio_ms"] = first_ms
                 turn["tts_total_ms"] = total_ms
             logger.info("[TTS_FIRST_AUDIO_MS] room=%s turn=%s ms=%s streamed=%s", self.room_name, turn_id, first_ms, bool(getattr(metric, "streamed", False)))
+            logger.info("[TTS_FIRST_AUDIO] room=%s turn=%s ms=%s streamed=%s", self.room_name, turn_id, first_ms, bool(getattr(metric, "streamed", False)))
+            logger.info("[FIRST_AUDIO_MS] room=%s turn=%s ms=%s source=tts_metrics streamed=%s", self.room_name, turn_id, first_ms, bool(getattr(metric, "streamed", False)))
             self._voice_latency.log(stage="tts", tts_first_audio_ms=first_ms)
             logger.info("[TTS_TOTAL_MS] room=%s turn=%s ms=%s audio_ms=%s chars=%s", self.room_name, turn_id, total_ms, int(float(getattr(metric, "audio_duration", 0.0) or 0.0) * 1000), getattr(metric, "characters_count", 0))
+            logger.info("[TTS_MS] room=%s turn=%s ms=%s first_audio_ms=%s chars=%s", self.room_name, turn_id, total_ms, first_ms, getattr(metric, "characters_count", 0))
             metric_start = float(getattr(metric, "timestamp", 0.0) or 0.0)
             first_audio_at = metric_start + float(getattr(metric, "ttfb", 0.0) or 0.0) if metric_start else None
             self._log_total_response(created_at=first_audio_at, source="tts_first_audio")
@@ -1204,13 +1603,16 @@ class CallLatencyTracker:
             total_ms = _ms_since(float(turn.get("final_transcript_mono") or time.perf_counter()))
         components = {
             "stt": turn.get("stt_ms") or 0,
+            "llm_queue": turn.get("llm_queue_ms") or 0,
             "llm_first_token": turn.get("llm_first_token_ms") or 0,
             "llm_total": turn.get("llm_total_ms") or 0,
+            "tts_generation": turn.get("tts_generation_ms") or 0,
             "tts_first_audio": turn.get("tts_first_audio_ms") or 0,
             "tts_total": turn.get("tts_total_ms") or 0,
             "db_save": turn.get("db_save_ms") or 0,
         }
         slowest = max(components.items(), key=lambda kv: kv[1])[0] if components else "unknown"
+        self.latency_samples.append(total_ms)
         logger.info(
             "[TOTAL_RESPONSE_MS] room=%s turn=%s ms=%s source=%s slowest=%s breakdown=%s",
             self.room_name,
@@ -1230,9 +1632,23 @@ class CallLatencyTracker:
         self._voice_latency.log(
             stage=source,
             stt_final_ms=int(components.get("stt") or 0),
+            llm_queue_ms=int(components.get("llm_queue") or 0),
             llm_first_token_ms=int(components.get("llm_first_token") or 0),
+            tts_generation_ms=int(components.get("tts_generation") or 0),
             tts_first_audio_ms=int(components.get("tts_first_audio") or 0),
             total_response_ms=total_ms,
+        )
+        logger.info(
+            "[TURN_LATENCY] room=%s turn=%s stt_ms=%s llm_queue_ms=%s llm_first_token_ms=%s tts_generation_ms=%s tts_first_audio_ms=%s total_response_ms=%s slowest_component=%s",
+            self.room_name,
+            turn.get("turn"),
+            int(components.get("stt") or 0),
+            int(components.get("llm_queue") or 0),
+            int(components.get("llm_first_token") or 0),
+            int(components.get("tts_generation") or 0),
+            int(components.get("tts_first_audio") or 0),
+            total_ms,
+            slowest,
         )
         if total_ms > 1500:
             logger.warning(
@@ -1243,6 +1659,170 @@ class CallLatencyTracker:
                 slowest,
                 json.dumps(components, ensure_ascii=True, separators=(",", ":")),
             )
+            logger.warning(
+                "[SLOW_TURN] room=%s turn=%s total_response_ms=%s slowest_subsystem=%s threshold_ms=1500",
+                self.room_name,
+                turn.get("turn"),
+                total_ms,
+                slowest,
+            )
+
+    def call_quality_score(
+        self,
+        *,
+        interruption_count: int,
+        fallback_count: int,
+        weak_stt_count: int,
+        repeated_question_attempts: int,
+        silence_recovery_count: int,
+    ) -> int:
+        avg_latency = int(sum(self.latency_samples) / max(1, len(self.latency_samples))) if self.latency_samples else 0
+        score = 100
+        score -= min(25, interruption_count * 3)
+        score -= min(20, fallback_count * 4)
+        score -= min(20, weak_stt_count * 4)
+        score -= min(15, repeated_question_attempts * 5)
+        score -= min(10, silence_recovery_count * 2)
+        if avg_latency > 1500:
+            score -= min(20, int((avg_latency - 1500) / 250) * 2)
+        score = max(0, min(100, score))
+        logger.info(
+            "[CALL_QUALITY_SCORE] room=%s score=%s avg_latency_ms=%s interruption_count=%s fallback_count=%s weak_stt_count=%s repeated_question_attempts=%s silence_recovery_count=%s",
+            self.room_name,
+            score,
+            avg_latency,
+            interruption_count,
+            fallback_count,
+            weak_stt_count,
+            repeated_question_attempts,
+            silence_recovery_count,
+        )
+        return score
+
+
+class ConnectedCallDiagnostics:
+    def __init__(
+        self,
+        *,
+        call_id: Any,
+        room_name: str,
+        destination: str,
+        trunk_id: str = "",
+        tts_provider: str = "",
+    ) -> None:
+        self.call_id = call_id
+        self.room_name = room_name
+        self.destination = destination
+        self.trunk_id = trunk_id
+        self.tts_provider = tts_provider
+        self.connected_at: str | None = None
+        self.first_audio_at: str | None = None
+        self.first_user_audio_at: str | None = None
+        self.first_stt_at: str | None = None
+        self.first_ai_reply_at: str | None = None
+        self.silence_detected = False
+        self.audio_issue_reason = ""
+        self._agent_joined_logged = False
+        self._track_logged = False
+        self._user_audio_logged = False
+        self._silent_task: asyncio.Task[Any] | None = None
+        self._stt_task: asyncio.Task[Any] | None = None
+
+    def _now(self) -> str:
+        return datetime.now(timezone.utc).isoformat()
+
+    def _update(self, **fields: Any) -> None:
+        if not self.call_id:
+            return
+        try:
+            import backend.db as db
+            db.update_call_quality_fields(self.call_id, **fields)
+        except Exception as exc:
+            logger.debug("[CALL_QUALITY_UPDATE_SKIPPED] id=%s reason=%s", self.call_id, type(exc).__name__)
+
+    def _create_task(self, coro: Any) -> None:
+        try:
+            asyncio.create_task(coro)
+        except RuntimeError:
+            pass
+
+    def mark_connected(self) -> None:
+        if self.connected_at:
+            return
+        self.connected_at = self._now()
+        logger.info(
+            "[CALL_CONNECTED] call_id=%s room_name=%s destination=%s trunk_id=%s",
+            self.call_id or "",
+            self.room_name,
+            self.destination,
+            self.trunk_id,
+        )
+        self._update(connected_at=self.connected_at, silence_detected=False, audio_issue_reason="")
+        self._create_task(self._watch_for_silent_connected_call())
+
+    def mark_agent_joined(self) -> None:
+        if self._agent_joined_logged:
+            return
+        self._agent_joined_logged = True
+        logger.info("[AGENT_JOINED] room_name=%s", self.room_name)
+
+    def mark_audio_track_published(self, participant: str = "agent") -> None:
+        if self._track_logged:
+            return
+        self._track_logged = True
+        logger.info("[AUDIO_TRACK_PUBLISHED] participant=%s", participant)
+
+    def mark_tts_started(self, provider: str | None = None) -> None:
+        logger.info("[TTS_STARTED] provider=%s", provider or self.tts_provider or "")
+
+    def mark_tts_audio_sent(self, bytes_or_duration: Any, *, text_preview: str = "") -> None:
+        first = self.first_audio_at is None
+        if first:
+            self.first_audio_at = self._now()
+            self._update(first_audio_at=self.first_audio_at, silence_detected=False, audio_issue_reason="")
+        logger.info("[TTS_AUDIO_SENT] bytes_or_duration=%s", bytes_or_duration)
+        if text_preview:
+            self.mark_ai_reply_sent(text_preview)
+
+    def mark_user_audio_detected(self) -> None:
+        if self._user_audio_logged:
+            return
+        self._user_audio_logged = True
+        self.first_user_audio_at = self._now()
+        logger.info("[USER_AUDIO_DETECTED]")
+        self._update(first_user_audio_at=self.first_user_audio_at)
+        self._create_task(self._watch_for_stt_stall())
+
+    def mark_stt_final(self, text: str) -> None:
+        if not self.first_stt_at:
+            self.first_stt_at = self._now()
+            self._update(first_stt_at=self.first_stt_at)
+        logger.info("[STT_FINAL] text=%s", str(text or "")[:240])
+
+    def mark_ai_reply_sent(self, text: str) -> None:
+        if not self.first_ai_reply_at:
+            self.first_ai_reply_at = self._now()
+            self._update(first_ai_reply_at=self.first_ai_reply_at)
+        logger.info("[AI_REPLY_SENT] text_preview=%s", re.sub(r"\s+", " ", str(text or "").strip())[:120])
+
+    def mark_call_ended(self, *, status: str, duration: int) -> None:
+        logger.info("[CALL_ENDED] status=%s duration=%s", status, duration)
+
+    async def _watch_for_silent_connected_call(self) -> None:
+        await asyncio.sleep(5)
+        if self.connected_at and not self.first_audio_at:
+            self.silence_detected = True
+            self.audio_issue_reason = "no_tts_audio_within_5s"
+            logger.warning("[SILENT_CONNECTED_CALL] call_id=%s reason=no_tts_audio_within_5s", self.call_id or "")
+            self._update(silence_detected=True, audio_issue_reason=self.audio_issue_reason)
+
+    async def _watch_for_stt_stall(self) -> None:
+        await asyncio.sleep(5)
+        if self.first_user_audio_at and not self.first_stt_at:
+            self.audio_issue_reason = "stt_stall"
+            logger.warning("[STT_STALL] call_id=%s", self.call_id or "")
+            self._update(audio_issue_reason=self.audio_issue_reason)
+
 
 async def entrypoint(ctx: JobContext):
     global agent_is_speaking, _FIRST_LIVEKIT_JOB_SEEN
@@ -1262,6 +1842,10 @@ async def entrypoint(ctx: JobContext):
     )
     logger.info("[LIVEKIT] room_connected name=%s job_id=%s", ctx.room.name, _job_id)
     logger.info(f"[ROOM] Connected: {ctx.room.name}")
+    if ctx.room.name in _ACTIVE_ROOM_NAMES:
+        logger.warning("[CALL_RESOURCE_USAGE] duplicate_room_name=true room=%s active_rooms=%s", ctx.room.name, len(_ACTIVE_ROOM_NAMES))
+    _ACTIVE_ROOM_NAMES.add(ctx.room.name)
+    logger.info("[CALL_RESOURCE_USAGE] room=%s active_rooms=%s process_uptime_ms=%s", ctx.room.name, len(_ACTIVE_ROOM_NAMES), _process_uptime_ms)
     latency_tracker = CallLatencyTracker(ctx.room.name)
 
     # ── Extract caller info ───────────────────────────────────────────────
@@ -1326,6 +1910,8 @@ async def entrypoint(ctx: JobContext):
     # ── Rate limiting (#37) ───────────────────────────────────────────────
     if is_rate_limited(caller_phone):
         logger.warning(f"[RATE-LIMIT] Blocked {caller_phone} — too many calls in 1h")
+        _ACTIVE_ROOM_NAMES.discard(ctx.room.name)
+        logger.info("[ROOM_CLEANUP] room=%s active_rooms=%s reason=rate_limited", ctx.room.name, len(_ACTIVE_ROOM_NAMES))
         return
 
     # ── Load config ───────────────────────────────────────────────────────
@@ -1409,6 +1995,13 @@ async def entrypoint(ctx: JobContext):
     env_openai_key = str(os.getenv("OPENAI_API_KEY") or "").strip()
     live_groq_key = str(live_config.get("groq_api_key") or "").strip()
     env_groq_key = str(os.getenv("GROQ_API_KEY") or "").strip()
+    call_diag = ConnectedCallDiagnostics(
+        call_id=call_record_id,
+        room_name=ctx.room.name,
+        destination=caller_phone,
+        tts_provider=tts_provider,
+    )
+    live_config["_call_diagnostics"] = call_diag
     openai_ready = not _looks_placeholder_secret(live_openai_key or env_openai_key)
     groq_ready = not _looks_placeholder_secret(live_groq_key or env_groq_key)
     if groq_ready:
@@ -1593,6 +2186,7 @@ async def entrypoint(ctx: JobContext):
                 db.mark_call_failed(call_record_id, "sip_failure", retry_count=retry_count, max_retries=max_retries)
             return
         else:
+            call_diag.trunk_id = outbound_trunk_id
             logger.info("[SIP] Dialing %s in room %s using trunk %s", caller_phone, ctx.room.name, outbound_trunk_id)
             try:
                 await ctx.api.sip.create_sip_participant(
@@ -1606,23 +2200,30 @@ async def entrypoint(ctx: JobContext):
                     )
                 )
                 logger.info("[SIP] Participant connected: %s", agent_tools._sip_identity)
+                call_diag.mark_connected()
                 if call_record_id:
                     import backend.db as db
                     db.mark_call_answered(call_record_id, room_name=ctx.room.name)
             except Exception as e:
                 logger.exception("[SIP] create_sip_participant failed for %s: %s", caller_phone, e)
-                failure_text = str(e).lower()
-                if "busy" in failure_text:
-                    reason = "busy"
-                elif "timeout" in failure_text or "timed out" in failure_text:
-                    reason = "timeout"
-                elif "no answer" in failure_text or "no_answer" in failure_text:
-                    reason = "no_answer"
-                else:
-                    reason = "sip_failure"
+                import backend.db as db
+                sip_failure = db.classify_sip_failure(e)
+                if sip_failure.get("sip_status") == "480":
+                    logger.warning(
+                        "[SIP_PROVIDER_FAILURE] status=480 trunk_id=%s destination=%s",
+                        outbound_trunk_id,
+                        caller_phone,
+                    )
                 if call_record_id:
-                    import backend.db as db
-                    db.mark_call_failed(call_record_id, reason, retry_count=retry_count, max_retries=max_retries)
+                    db.mark_sip_call_failed(
+                        call_record_id,
+                        sip_failure,
+                        retry_count=retry_count,
+                        max_retries=max_retries,
+                        retryable=db.call_retry_policy_enabled(str(owner_workspace_id or "") or None),
+                        trunk_id=outbound_trunk_id,
+                        destination=caller_phone,
+                    )
                 return
     else:
         logger.info("[SIP] No outbound phone number — running inbound/browser session without SIP dial.")
@@ -1741,6 +2342,7 @@ async def entrypoint(ctx: JobContext):
     interrupt_count = 0  # (#30)
 
     # ── Build agent ───────────────────────────────────────────────────────
+    live_config["room_name"] = ctx.room.name
     agent = OutboundAssistant(
         agent_tools=agent_tools,
         first_line=live_config.get("first_line", ""),
@@ -1799,6 +2401,8 @@ async def entrypoint(ctx: JobContext):
 
     await session.start(room=ctx.room, agent=agent, room_input_options=room_input)
     logger.info("[AUDIO] Track published")
+    call_diag.mark_agent_joined()
+    call_diag.mark_audio_track_published("agent")
 
     # ── TTS pre-warm (#12) ────────────────────────────────────────────────
     try:
@@ -1904,6 +2508,27 @@ async def entrypoint(ctx: JobContext):
     shutdown_completed = False
     last_user_activity = time.time()
     last_partial_transcript = ""
+    background_tasks: set[asyncio.Task[Any]] = set()
+
+    def _create_call_task(coro: Any, *, name: str) -> asyncio.Task[Any]:
+        task = asyncio.create_task(coro, name=name)
+        background_tasks.add(task)
+
+        def _done(done_task: asyncio.Task[Any]) -> None:
+            background_tasks.discard(done_task)
+            if done_task.cancelled():
+                logger.info("[ORPHAN_TASK_CLEANUP] room=%s task=%s cancelled=true", ctx.room.name, name)
+                return
+            try:
+                exc = done_task.exception()
+            except Exception as e:
+                logger.debug("[ORPHAN_TASK_CLEANUP] room=%s task=%s exception_read_failed=%s", ctx.room.name, name, e)
+                return
+            if exc:
+                logger.info("[ORPHAN_TASK_CLEANUP] room=%s task=%s error=%s", ctx.room.name, name, type(exc).__name__)
+
+        task.add_done_callback(_done)
+        return task
 
     iw_raw = live_config.get("interruption_words") or []
     if isinstance(iw_raw, str):
@@ -1934,22 +2559,27 @@ async def entrypoint(ctx: JobContext):
             if turn_count == 0:
                 continue
             if time.time() - last_user_activity >= silence_timeout_seconds:
-                logger.info("[INACTIVITY] No caller speech for %ss; ending call.", silence_timeout_seconds)
-                shutdown_requested = True
+                logger.info("[INACTIVITY] No caller speech for %ss; recovery_count=%s", silence_timeout_seconds, agent._silence_recovery_count + 1)
                 try:
+                    prompt = agent._silence_recovery_prompt()
                     if agent._can_send_for_current_turn(source="inactivity_watchdog"):
-                        await agent._say_guarded("Okay sir, thanks.", allow_interruptions=True, wait=True, lifecycle="inactivity_watchdog")
+                        await agent._say_guarded(prompt, allow_interruptions=True, wait=True, lifecycle="inactivity_watchdog")
                     else:
                         logger.info("[WAITING_FOR_USER] turn_id=%s source=inactivity_watchdog_no_reply", agent.current_turn_id)
                 except Exception:
                     pass
+                if agent._silence_recovery_count < 3:
+                    last_user_activity = time.time()
+                    continue
+                shutdown_requested = True
                 try:
+                    agent._transition_call_stage("completed", reason="silence_recovery_limit")
                     session.shutdown(drain=True)
                 except Exception as e:
                     logger.warning(f"[INACTIVITY] Session shutdown failed: {e}")
                 return
 
-    asyncio.create_task(_inactive_call_watchdog())
+    _create_call_task(_inactive_call_watchdog(), name="inactive_call_watchdog")
 
     max_dur = int(call_cfg.get("total_call_timeout_seconds") or 0)
     if max_dur > 0:
@@ -1973,11 +2603,14 @@ async def entrypoint(ctx: JobContext):
             except Exception as e:
                 logger.warning(f"[CALL_LIMIT] Session shutdown failed: {e}")
 
-        asyncio.create_task(_max_call_duration_watchdog())
+        _create_call_task(_max_call_duration_watchdog(), name="max_call_duration_watchdog")
 
     # ── Session event handlers ────────────────────────────────────────────
     @session.on("user_state_changed")
     def _user_state_changed(ev):
+        if getattr(ev, "new_state", None) == "speaking":
+            latency_tracker.mark_user_speaking_start(getattr(ev, "created_at", None))
+            call_diag.mark_user_audio_detected()
         if getattr(ev, "old_state", None) == "speaking" and getattr(ev, "new_state", None) != "speaking":
             latency_tracker.mark_user_speaking_end(getattr(ev, "created_at", None))
 
@@ -1988,6 +2621,7 @@ async def entrypoint(ctx: JobContext):
             str(getattr(ev, "new_state", "")),
             getattr(ev, "created_at", None),
         )
+        agent._agent_is_speaking = str(getattr(ev, "new_state", "")) == "speaking"
 
     @session.on("user_input_transcribed")
     def _user_input_transcribed(ev):
@@ -2007,6 +2641,7 @@ async def entrypoint(ctx: JobContext):
         if transcript:
             last_partial_transcript = ""
             latency_tracker.mark_final_transcript(transcript, getattr(ev, "created_at", None))
+            call_diag.mark_stt_final(transcript)
 
     @session.on("metrics_collected")
     def _metrics_collected(ev):
@@ -2024,18 +2659,21 @@ async def entrypoint(ctx: JobContext):
         text = str(content or "").strip()
         if text:
             agent.note_external_assistant_response(source="conversation_item_added")
-            asyncio.create_task(_log_transcript("assistant", text))
+            call_diag.mark_ai_reply_sent(text)
+            _create_call_task(_log_transcript("assistant", text), name="log_transcript_assistant")
 
     @session.on("agent_speech_started")
     def _agent_speech_started(ev):
         global agent_is_speaking
         agent_is_speaking = True
+        agent._agent_is_speaking = True
         latency_tracker._log_total_response(created_at=time.time(), source="legacy_agent_speech_started")
 
     @session.on("agent_speech_finished")
     def _agent_speech_finished(ev):
         global agent_is_speaking
         agent_is_speaking = False
+        agent._agent_is_speaking = False
 
     # Interrupt logging (#30)
     @session.on("agent_speech_interrupted")
@@ -2058,6 +2696,7 @@ async def entrypoint(ctx: JobContext):
             return
         if not transcript or len(transcript) < 3:
             return
+        call_diag.mark_stt_final(transcript)
         agent.begin_committed_user_turn(transcript)
         if transcript_lower in filler_word_set and not _is_soft_ack(transcript):
             logger.debug(f"[FILTER-FILLER] Dropped: '{transcript}'")
@@ -2065,7 +2704,7 @@ async def entrypoint(ctx: JobContext):
 
         # Real-time transcript stream
         last_user_activity = time.time()
-        asyncio.create_task(_log_transcript("user", transcript))
+        _create_call_task(_log_transcript("user", transcript), name="log_transcript_user")
 
         # Turn counter + auto-close (#29)
         turn_count += 1
@@ -2080,6 +2719,7 @@ async def entrypoint(ctx: JobContext):
         global agent_is_speaking
         logger.info(f"[HANGUP] Participant disconnected: {participant.identity}")
         agent_is_speaking = False
+        agent._agent_is_speaking = False
         if shutdown_requested:
             return
         shutdown_requested = True
@@ -2102,6 +2742,16 @@ async def entrypoint(ctx: JobContext):
         shutdown_completed = True
         logger.info("[SHUTDOWN] Sequence started.")
         try:
+            pending_tasks = [task for task in list(background_tasks) if not task.done()]
+            for task in pending_tasks:
+                task.cancel()
+            logger.info("[ORPHAN_TASK_CLEANUP] room=%s pending_tasks_cancelled=%s", ctx.room.name, len(pending_tasks))
+            logger.info(
+                "[CALL_RESOURCE_USAGE] room=%s active_rooms=%s pending_tasks=%s",
+                ctx.room.name,
+                len(_ACTIVE_ROOM_NAMES),
+                len(pending_tasks),
+            )
             try:
                 orchestrator.end_session()
             except Exception as e:
@@ -2115,6 +2765,18 @@ async def entrypoint(ctx: JobContext):
                 return True
     
             duration = int((datetime.now() - call_start_time).total_seconds())
+            call_diag.mark_call_ended(status="completed", duration=duration)
+            if agent._fast_router.state.current_stage != "completed":
+                agent._transition_call_stage("closing", reason="shutdown")
+                agent._transition_call_stage("completed", reason="shutdown")
+            agent._call_summary_log(duration_seconds=duration, language_mode=str(live_config.get("language") or live_config.get("lang_preset") or ""))
+            latency_tracker.call_quality_score(
+                interruption_count=interrupt_count + agent._barge_in.interrupt_count,
+                fallback_count=agent._fallback_count,
+                weak_stt_count=agent._weak_stt_count,
+                repeated_question_attempts=agent._fast_router.state.repeated_question_count,
+                silence_recovery_count=agent._silence_recovery_count,
+            )
     
             # Booking
             booking_status_msg = "No booking"
@@ -2388,6 +3050,9 @@ async def entrypoint(ctx: JobContext):
     
         except Exception as _ush:
             logger.exception("[ERROR] unified_shutdown_hook fatal: %s", _ush)
+        finally:
+            _ACTIVE_ROOM_NAMES.discard(ctx.room.name)
+            logger.info("[ROOM_CLEANUP] room=%s active_rooms=%s shutdown_completed=%s", ctx.room.name, len(_ACTIVE_ROOM_NAMES), shutdown_completed)
     ctx.add_shutdown_callback(unified_shutdown_hook)
 
 
